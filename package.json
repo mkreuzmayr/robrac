@@ -1,0 +1,68 @@
+{
+  "name": "robrac",
+  "version": "0.1.0",
+  "description": "Role Based Resource Access Control - an ORM-independent, multi-tenant resource authorization plugin for Better Auth",
+  "keywords": [
+    "authorization",
+    "better-auth",
+    "rbac",
+    "rebac",
+    "resource-access"
+  ],
+  "homepage": "https://github.com/mkreuzmayr/robrac#readme",
+  "bugs": "https://github.com/mkreuzmayr/robrac/issues",
+  "license": "MIT",
+  "author": "Michael Kreuzmayr",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mkreuzmayr/robrac.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./client": {
+      "types": "./dist/client.d.mts",
+      "default": "./dist/client.mjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.mts",
+      "default": "./dist/testing.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "clean": "rm -rf dist node_modules",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint . --report-unused-disable-directives",
+    "prepack": "pnpm build",
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "verify": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "better-auth": "1.6.26",
+    "oxfmt": "0.62.0",
+    "oxlint": "1.77.0",
+    "oxlint-tsgolint": "7.0.2001",
+    "tsdown": "0.22.14",
+    "typescript": "7.0.2"
+  },
+  "peerDependencies": {
+    "better-auth": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.20.0"
+}

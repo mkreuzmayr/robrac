@@ -1,0 +1,25 @@
+{
+  "[css][html][javascript][javascriptreact][json][jsonc][markdown][toml][typescript][typescriptreact][yaml]": {
+    "editor.defaultFormatter": "oxc.oxc-vscode"
+  },
+  "editor.codeActionsOnSave": {
+    "source.format.oxc": "always",
+    "source.fixAll.oxc": "always"
+  },
+  "eslint.enable": false,
+  "files.readonlyInclude": {
+    "**/routeTree.gen.ts": true
+  },
+  "files.watcherExclude": {
+    "**/routeTree.gen.ts": true
+  },
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "oxc.configPath": ".oxlintrc.json",
+  "oxc.enable": true,
+  "oxc.fixKind": "safe_fix",
+  "oxc.fmt.configPath": ".oxfmtrc.json",
+  "oxc.lint.run": "onType",
+  "search.exclude": {
+    "**/routeTree.gen.ts": true
+  }
+}
