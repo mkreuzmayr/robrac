@@ -1,0 +1,90 @@
+name: Release
+
+# Pushing a `v*` tag is what publishes. `changeset version` only writes the version
+# and the changelog; it never publishes (version-only mode).
+on:
+  push:
+    tags: ['v*']
+
+# `id-token: write` is the whole authentication story — npm trusted publishing (OIDC)
+# means there is no NODE_AUTH_TOKEN in this repo and provenance is attached
+# automatically. `contents: write` is for cutting the GitHub Release.
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  release:
+    name: publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs a recent npm even though pnpm drives the upload —
+      # the OIDC exchange lives in the npm CLI.
+      - name: Use a trusted-publishing-capable npm
+        run: npm install -g npm@latest
+
+      - run: pnpm install --frozen-lockfile
+
+      # The tag is the release's only source of truth for *which* version ships, so it
+      # must agree with the manifest before anything is built.
+      - name: Tag must match package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "releasing $pkg"
+
+      # Re-run everything from scratch. A green tick on the same commit from the CI
+      # workflow is not evidence about *this* checkout.
+      - run: pnpm verify
+
+      - run: pnpm format:check
+
+      - name: No sourcemaps in the tarball
+        run: |
+          pnpm pack --pack-destination ./pack
+          tar -tzf ./pack/*.tgz | sort
+          if tar -tzf ./pack/*.tgz | grep -q '\.map$'; then
+            echo "::error::sourcemaps leaked into the published tarball"
+            exit 1
+          fi
+
+      # `--no-git-checks`: a tag checkout is a detached HEAD, which pnpm otherwise
+      # refuses to publish from. No `--provenance` flag: trusted publishing generates
+      # provenance itself, and passing the flag conflicts with it.
+      - name: Publish to npm (OIDC)
+        run: pnpm publish --no-git-checks --access public
+
+      # The changelog section for this version *is* the release notes; anything else
+      # would be a second, divergent account of the same release.
+      - name: Slice the changelog section
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 == "## " v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::no '## $version' section in CHANGELOG.md"
+            exit 1
+          fi
+          cat release-notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md

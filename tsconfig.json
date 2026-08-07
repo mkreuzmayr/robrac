@@ -29,6 +29,6 @@
     "allowUnreachableCode": false,
     "allowUnusedLabels": false
   },
-  "include": ["**/*.ts"],
+  "include": ["**/*.ts", "scripts/**/*.mjs"],
   "exclude": ["node_modules", "dist"]
 }

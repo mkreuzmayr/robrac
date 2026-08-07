@@ -10,3 +10,9 @@ dist
 
 # debug
 .pnpm-debug.log*
+
+# pack output
+pack
+
+# never commit a registry credential
+.npmrc

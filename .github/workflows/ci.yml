@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The toolchain (tsdown, and `node --test` on TypeScript sources) needs Node 22.18+,
+  # so `verify` cannot run on Node 20. The `consume` job below is what actually holds
+  # `engines.node: ">=20"` honest.
+  verify:
+    name: verify (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm verify
+
+      - run: pnpm format:check
+
+  pack:
+    name: pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Pack the tarball
+        run: pnpm pack --pack-destination ./pack
+
+      - name: Show tarball contents
+        run: tar -tzf ./pack/*.tgz | sort
+
+      - name: No sourcemaps in the tarball
+        run: |
+          if tar -tzf ./pack/*.tgz | grep -q '\.map$'; then
+            echo "::error::sourcemaps leaked into the published tarball"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: pack/*.tgz
+          retention-days: 7
+
+  # Installs the packed tarball into a throwaway project on every Node version
+  # `engines.node` claims to support, and imports all three entrypoints from outside
+  # the repo.
+  consume:
+    name: consume (node ${{ matrix.node }})
+    needs: pack
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: pack
+
+      - name: Smoke the published artifact
+        run: node scripts/smoke-consumer.mjs "$(ls pack/*.tgz)"

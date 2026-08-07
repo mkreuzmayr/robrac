@@ -744,6 +744,13 @@ pnpm verify      # lint, typecheck, test, build
 The test suite runs on `node --test` against `src/` directly — no build step, no test
 framework.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the changeset and release conventions —
+notably that while robrac is pre-1.0, a breaking change takes a **`minor`** bump.
+
+## Changelog
+
+Every released version is recorded in [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## License
