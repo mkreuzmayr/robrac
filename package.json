@@ -1,6 +1,6 @@
 {
   "name": "robrac",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Role Based Resource Access Control - an ORM-independent, multi-tenant resource authorization plugin for Better Auth",
   "keywords": [
     "authorization",

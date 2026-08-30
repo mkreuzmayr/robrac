@@ -1,5 +1,11 @@
 # robrac
 
+## 0.1.1
+
+### Patch Changes
+
+- Verify the release pipeline: no functional change.
+
 ## 0.1.0
 
 ### Minor Changes
