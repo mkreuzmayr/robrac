@@ -1,10 +1,9 @@
 # robrac
 
-**Ro**le **B**ased **R**esource **A**ccess **C**ontrol — a Better Auth plugin for the
-authorization question that organization-level RBAC cannot answer.
+robrac adds resource-level role-based access control to Better Auth.
 
-Better Auth's `organization` plugin tells you whether a member may edit _recordings_.
-robrac tells you whether they may edit **this** recording.
+Better Auth's `organization` plugin can tell you whether a member may edit recordings.
+robrac can tell you whether they may edit a specific recording.
 
 ```ts
 await robrac.check({
@@ -20,34 +19,30 @@ await robrac.check({
 
 ## Why another authorization package
 
-Most per-resource authorization code in a Better Auth app ends up hardcoded against
-that app's ORM, its `member` table and its one resource type. robrac keeps three
-things abstract so it stays a library rather than a fork of your data model:
+Authorization for individual resources often gets tied to an app's ORM, `member`
+table and resource types. robrac keeps three parts configurable:
 
-| Concept      | What it is                              | Why abstract                                                                                 |
-| ------------ | --------------------------------------- | -------------------------------------------------------------------------------------------- |
-| **Subject**  | who is asking — `{ type, id }`          | Grants go to users, org members, teams, service accounts or API keys without a schema change |
-| **Scope**    | the tenant a decision is made in        | Multi-tenant by default, `null` for single-tenant, and cross-tenant reads are impossible     |
-| **Resource** | what is being accessed — `{ type, id }` | robrac never needs to know your tables; you teach it how to load one                         |
+| Concept      | What it means                            | Why it is configurable                                                             |
+| ------------ | ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Subject**  | who is asking, identified by type and ID | Grants can target users, organization members, teams, service accounts or API keys |
+| **Scope**    | the tenant for an access decision        | Use a required tenant ID, an optional tenant ID or `null` for a single-tenant app  |
+| **Resource** | what the subject wants to access         | Each resource definition provides its own type, loader, roles and permissions      |
 
 Persistence goes through a single [`GrantStore`](src/store/types.ts) interface. The
-default implementation rides on Better Auth's own adapter, so robrac runs on Drizzle,
-Prisma, Kysely, MongoDB or a raw connection with **zero ORM-specific code**.
+default implementation uses Better Auth's adapter. It works with Drizzle, Prisma,
+Kysely, MongoDB or a raw connection without ORM-specific code in robrac.
 
 ### What it gives you beyond a `resource_roles` table
 
-- **Role inheritance** — `editor extends viewer`, resolved once at boot.
-- **Computed roles** — "the creator is the owner", "org-visible documents are readable
-  by every member" — no rows written for the common case.
-- **Resource hierarchy** — a grant on a folder cascades onto its documents, with an
-  explicit role translation between the two namespaces.
-- **Grant expiry** — time-boxed access without a cleanup job.
-- **Anti-escalation** — a share-capable editor cannot mint owners. On by default.
-- **Overrides** — legal hold, suspended tenant, break-glass admin.
-- **Audit hooks** — every decision and every grant change.
-- **Batch evaluation** — one query per page of resources, not one per row.
-- **Boot-time validation** — a role that references an action you never declared is a
-  startup error, not a silent denial six months later.
+- Roles can inherit from other roles. robrac resolves `editor extends viewer` at boot.
+- Computed roles cover rules such as "the creator is the owner" without storing a grant.
+- Grants on parent resources can apply to their children through an explicit role mapping.
+- Grants can expire without a cleanup job.
+- Anti-escalation stops an editor with sharing rights from granting an owner role. It is on by default.
+- Overrides handle cases such as legal holds, suspended tenants and break-glass access.
+- Hooks report access decisions and grant changes.
+- Batch evaluation uses one grant query for a page of resources instead of one per row.
+- Startup validation rejects roles that refer to undeclared actions.
 
 ---
 
@@ -57,12 +52,12 @@ Prisma, Kysely, MongoDB or a raw connection with **zero ORM-specific code**.
 pnpm add robrac
 ```
 
-`better-auth` `^1.6` is a peer dependency; `zod` `^4` comes along as a regular
-dependency (better-auth depends on it too, so it dedupes).
+`better-auth` `^1.6` is a peer dependency. `zod` `^4` is a regular dependency and
+can be deduplicated with Better Auth's copy.
 
-robrac ships as ESM with generated types and imports **no `node:` builtins**, so it
-runs on Node, Bun, Deno and edge runtimes alike. `engines.node` declares `>=20` as an
-honest floor, not a hard gate.
+robrac ships as ESM with generated types and imports no `node:` built-ins. It runs on
+Node, Bun, Deno and edge runtimes. The package declares Node 20 or newer in
+`engines.node`.
 
 ---
 
@@ -95,7 +90,7 @@ export const recording = defineResource({
   load: async ({ id }) =>
     await db.query.recording.findFirst({ where: eq(t.id, id) }),
 
-  // Strongly recommended: without it, a page of 50 issues 50 loads.
+  // Implement this to load a page of 50 resources in one call instead of 50.
   loadMany: async ({ ids }) => {
     const rows = await db.select().from(t).where(inArray(t.id, ids));
     return new Map(rows.map((row) => [row.id, row]));
@@ -104,15 +99,14 @@ export const recording = defineResource({
   // The tenant this row belongs to. A mismatch makes it invisible.
   scope: (row) => row.organizationId,
 
-  // Roles that follow from the data rather than from a stored grant. The
-  // `roles` accumulator is typed to the role names declared above, so a typo
-  // is a compile error.
+  // Derive roles from the resource instead of a stored grant. TypeScript checks
+  // values pushed to `roles` against the role names declared above.
   computeRoles: ({ data, subjects, roles }) => {
     if (hasSubject(subjects, 'user', data.createdBy)) roles.push('owner');
     if (data.visibility === 'organization') roles.push('viewer');
   },
 
-  // What a caller must be allowed to do in order to hand out grants.
+  // A caller needs this permission to manage grants.
   manage: { recording: ['share'] },
 });
 ```
@@ -136,18 +130,17 @@ export const auth = betterAuth({
 export type Auth = typeof auth;
 ```
 
-By default robrac resolves:
+By default, robrac reads the scope from `session.activeOrganizationId`. It resolves
+the following subjects for the current session:
 
-- **scope** from `session.activeOrganizationId`
-- **subjects** as `[{ type: 'user', id }, { type: 'member', id }]`
+- `{ type: 'user', id }`
+- `{ type: 'member', id }`
 
-Both are single options away from anything else — see [Subjects and scopes](#subjects-and-scopes).
+You can replace both resolvers. See [Subjects and scopes](#subjects-and-scopes).
 
-> **A session with no active organization has no scope.** Under the default
-> `scope: 'required'` that is an error (`SCOPE_REQUIRED`, HTTP 403 with a message
-> saying so) rather than a blanket denial — a silent "you may do nothing" is
-> indistinguishable from a permission bug and takes hours to diagnose. Make sure
-> `setActive` has run, or supply your own `resolveScope`.
+> A session with no active organization has no scope. With the default
+> `scope: 'required'`, robrac returns `SCOPE_REQUIRED` with HTTP status 403. Call
+> `setActive` first or provide your own `resolveScope`.
 
 ### 3. Migrate the database
 
@@ -156,8 +149,8 @@ npx @better-auth/cli generate   # Drizzle / Prisma
 npx @better-auth/cli migrate    # built-in adapter
 ```
 
-Then add the composite index Better Auth's schema DSL cannot express — see
-[Indexes](#indexes). It is not optional in production.
+Then add the composite index described in [Indexes](#indexes). Better Auth's schema
+DSL cannot create it. Production deployments need this index.
 
 ### 4. Use it
 
@@ -178,8 +171,8 @@ const decision = await robrac.evaluate({
 
 decision.found; // false when it does not exist in this tenant
 decision.effectiveRoles; // ['owner']
-decision.permissions.recording.share; // true — typed, a typo is a compile error
-decision.roles; // provenance: explicit / computed / inherited
+decision.permissions.recording.share; // true; a typo is a compile error
+decision.roles; // explicit, computed and inherited roles with their sources
 ```
 
 Through the API, from a route handler:
@@ -219,7 +212,7 @@ await authClient.robrac.check({
 
 ### Decisions
 
-Everything is derived from one object:
+`evaluate()` returns an `AccessDecision`:
 
 ```ts
 type AccessDecision = {
@@ -234,14 +227,14 @@ type AccessDecision = {
 };
 ```
 
-`check()` is nothing more than a predicate over `permissions`. `require()` is
-`check()` that throws.
+`check()` tests the permission matrix. `require()` runs the same check and throws when
+access is denied.
 
 ### Roles
 
-A role is a permission map. `extendRole` adds inheritance, and Better Auth's
-`createAccessControl(...).newRole(...)` objects are accepted unchanged, so an existing
-access-control setup can be handed over as-is:
+A role is a permission map. `extendRole` adds inheritance. robrac also accepts objects
+created by Better Auth's `createAccessControl(...).newRole(...)`, so you can reuse an
+existing access-control setup:
 
 ```ts
 roles: {
@@ -251,8 +244,8 @@ roles: {
 }
 ```
 
-Inheritance is flattened at construction. Cycles and references to undeclared roles
-throw at boot.
+robrac resolves inheritance when it starts. Cycles and references to undeclared roles
+cause startup errors.
 
 ### Permission requests
 
@@ -263,13 +256,12 @@ Actions and facets are `AND`ed by default:
 { recording: { actions: ['update', 'delete'], connector: 'OR' } }  // either
 ```
 
-An **empty request is never satisfied**. An accidentally empty permission object is a
-bug, and treating it as "allowed" is the kind of bug that ships.
+An empty request is never satisfied. An accidentally empty permission object is a bug,
+and treating it as allowed would hide that bug.
 
 ### Computed roles
 
-The cheapest grant is the one you never store. `computeRoles` derives roles from the
-resource itself:
+`computeRoles` derives roles from the resource without storing grants:
 
 ```ts
 computeRoles: ({ data, subjects, roles }) => {
@@ -277,24 +269,22 @@ computeRoles: ({ data, subjects, roles }) => {
 },
 ```
 
-The `roles` accumulator — and the return value, if you prefer returning an array —
-is typed to the names declared in the resource's `roles` map, so `roles.push('onwer')`
-fails to compile instead of becoming a role that silently confers nothing. Push,
-return, or both; the engine takes the union. `inheritRole`'s return value is
-constrained the same way.
+TypeScript checks the `roles` accumulator and any returned array against the names in
+the resource's `roles` map. For example, `roles.push('onwer')` fails to compile. You
+can push roles, return an array or do both. The engine combines the results.
+`inheritRole` checks its return value against the same role names.
 
 ### Overrides
 
-`override` short-circuits the whole decision — useful for states that are not about
-roles at all:
+`override` returns a decision before robrac evaluates roles. Use it for states such as
+a legal hold:
 
 ```ts
 override: ({ data }) => (data.legalHold ? 'deny' : null),
 ```
 
-`'deny'` blanks every action, `'allow'` grants every declared one. Overrides also
-suppress the anti-escalation check when they return `'allow'`, which is what makes a
-break-glass admin role practical.
+`'deny'` clears every action. `'allow'` grants every declared action and skips the
+anti-escalation check, which lets a break-glass administrator grant any role.
 
 ### Resource hierarchy
 
@@ -306,12 +296,11 @@ inheritRole: ({ role }) => (role === 'curator' ? 'editor' : null),
 ```
 
 Without `inheritRole`, an ancestor role carries over only when the child declares a
-role of the same name; anything else is dropped rather than guessed at. The walk is
-bounded by `maxInheritanceDepth` (default 5), so a cycle in your data cannot hang a
-request, and each level costs one batched query regardless of how many resources are
-being evaluated.
+role with the same name. robrac drops any other role. `maxInheritanceDepth` defaults
+to 5, which prevents a data cycle from hanging a request. Each level adds one batched
+query, regardless of the number of resources in the batch.
 
-Ancestors are scope-checked like anything else: a parent in another tenant contributes
+robrac also checks the scope of each ancestor. A parent in another tenant contributes
 nothing.
 
 ---
@@ -333,13 +322,12 @@ robrac({
 });
 ```
 
-The bundled default resolves the user plus their membership in the active
-organization. Pass `defaultSubjectResolver({ includeTeams: true })` to also pick up
-the organization plugin's teams.
+The default resolver returns the user and their membership in the active organization.
+Pass `defaultSubjectResolver({ includeTeams: true })` to include teams from the
+organization plugin.
 
-Subjects are **additive**: a caller's effective roles are the union across every
-identity they hold, so a team grant and a personal grant compose without special
-cases.
+robrac combines roles from every subject identity. A caller receives both their
+personal grants and their team grants.
 
 ### Multi-tenancy modes
 
@@ -349,22 +337,21 @@ cases.
 | `'optional'` | Scope is matched when the definition provides it                                |
 | `'disabled'` | Single-tenant; scope is always `null`                                           |
 
-`'required'` is what makes cross-tenant access structurally impossible rather than a
-thing you remembered to check.
+With `'required'`, robrac checks the scope before it applies roles or permissions. A
+resource in another scope reads as not found.
 
 ---
 
 ## Listing resources
 
-This is the part most per-resource authorization gets wrong, so it is worth being
-explicit.
+Listing needs different handling from a single-resource check.
 
-**Do not** fetch a page and filter it afterwards. You get short pages, wrong totals
-and a permission check per row. robrac deliberately does not offer that API.
+Do not fetch a page and filter it afterwards. That produces short pages, wrong totals
+and one permission check per row. robrac does not provide that API.
 
-Instead, push access into the query. `accessibleResourceIds` gives you the ids backed
-by a stored grant; your computed roles are already expressible in SQL because they
-live in your own columns:
+Apply access rules in the query instead. `accessibleResourceIds` returns the IDs
+backed by stored grants. Add computed roles to the query using the columns that those
+roles inspect:
 
 ```ts
 const grantedIds = await robrac.accessibleResourceIds({
@@ -391,10 +378,11 @@ const rows = await db
   .limit(20);
 ```
 
-One indexed query, correct pagination, correct totals.
+This produces one indexed query with correct pagination and totals.
 
-When you already hold a page — a search result, an id list from another service —
-`filterAccessible` and `evaluateMany` evaluate the whole batch with one grant query:
+If you already have a page, such as search results or an ID list from another service,
+use `filterAccessible` or `evaluateMany`. Both evaluate the batch with one grant
+query:
 
 ```ts
 const allowed = await robrac.filterAccessible({
@@ -410,10 +398,11 @@ const allowed = await robrac.filterAccessible({
 
 ## Managing grants
 
-Two tiers, and the distinction is deliberate.
+robrac has separate grant APIs for trusted code and requests made on behalf of a user.
 
-`robrac.grants.*` are **unchecked primitives** for trusted server-side paths — seeds,
-migrations, admin tooling, back-office jobs:
+Use `robrac.grants.*` only in trusted server-side code such as seeds, migrations,
+administration tools and background jobs. These methods do not perform authorization
+checks:
 
 ```ts
 await robrac.grants.grant({
@@ -432,9 +421,9 @@ await robrac.grants.revokeSubject({ subject, scope });    // member left
 await robrac.grants.revokeScope({ scope });               // tenant deleted
 ```
 
-`robrac.authorized.*` is the same surface **on behalf of a caller**. It enforces the
-resource's `manage` permission and, unless `escalation: 'allow'`, refuses to grant
-more than the caller holds:
+Use `robrac.authorized.*` when acting on behalf of a caller. These methods enforce the
+resource's `manage` permission. Unless you set `escalation: 'allow'`, they also refuse
+to grant permissions that the caller does not have:
 
 ```ts
 await robrac.authorized.grant({
@@ -450,15 +439,15 @@ The HTTP endpoints use the `authorized` tier exclusively.
 
 ### Cleanup
 
-Grants have no foreign key on `subjectId` — subjects are heterogeneous by design, and
-one column cannot reference several tables. In exchange:
+Grants have no foreign key on `subjectId` because one subject column can represent
+records from several tables.
 
-- `scope` _can_ be a real foreign key: set `schema.grant.scopeReferences` and you get
-  database-level cascade on tenant deletion.
-- The plugin wires best-effort cleanup to `/organization/remove-member`,
+- Set `schema.grant.scopeReferences` to make `scope` a foreign key and cascade tenant
+  deletions in the database.
+- The plugin attempts cleanup after `/organization/remove-member`,
   `/organization/leave` and `/organization/delete`.
-- Removing a member is already safe without any of this: subject resolution can no
-  longer produce that member id, so the rows are inert. Cleanup is hygiene.
+- A removed member's grants cannot provide access because subject resolution no
+  longer returns that member ID. Cleanup removes the unused rows.
 
 Call `grants.revokeResource` when you delete a resource.
 
@@ -475,24 +464,23 @@ Call `grants.revokeResource` when you delete a resource.
 | `POST /robrac/grants/grant`   | `grantResourceRole`         | `robrac.grants.grant`  |
 | `POST /robrac/grants/set`     | `setResourceRoles`          | `robrac.grants.set`    |
 | `POST /robrac/grants/revoke`  | `revokeResourceRole`        | `robrac.grants.revoke` |
-| `POST /robrac/accessible-ids` | `listAccessibleResourceIds` | — (server only)        |
+| `POST /robrac/accessible-ids` | `listAccessibleResourceIds` | server only            |
 
-`resourceType` is a discriminant: picking `'recording'` narrows `permissions` and
-`role` to what that resource declares, on both sides of the wire.
+`resourceType` is a discriminant. Selecting `'recording'` narrows `permissions` and
+`role` to the values declared by that resource on both the client and server.
 
-Responses never include the loaded resource. robrac answers "what may this caller do";
-serving the record stays your application's job, which keeps field-level redaction
-where it belongs.
+Responses never include the loaded resource. robrac reports what the caller may do.
+Your application remains responsible for returning the record and redacting fields.
 
-Rate limits default to 120 reads / 10s and 30 grant mutations / 60s per path group,
-and are configurable or disableable via `rateLimit`.
+The default rate limits are 120 reads per 10 seconds and 30 grant mutations per 60
+seconds for each path group. Configure or disable them with `rateLimit`.
 
 ### Share dialogs
 
-`grants/list` returns `availableRoles` already filtered by the anti-escalation rule
-that `grants/grant` enforces, so a dialog rendered from it cannot offer a role that
-will be rejected on submit. `declaredRoles` carries the full list when you need to
-show the ungrantable ones greyed out.
+`grants/list` filters `availableRoles` using the same anti-escalation rule as
+`grants/grant`. A dialog built from this list will not offer a role that the server
+rejects on submit. `declaredRoles` contains every role if you need to show unavailable
+ones in a disabled state.
 
 It returns raw `(subjectType, subjectId)` pairs for the grants themselves. To render
 names, supply a describer:
@@ -525,34 +513,33 @@ robrac({
 
 ### The contract
 
-Nine required methods plus an optional `transaction`, documented in
-[`src/store/types.ts`](src/store/types.ts). The [store test suite](test/store.test.ts)
-is written as a shared contract and runs against both bundled implementations — copy
-it verbatim to validate a custom store.
+The store contract has nine required methods and an optional `transaction` method.
+See [`src/store/types.ts`](src/store/types.ts). The
+[store test suite](test/store.test.ts) runs the same contract tests against both
+bundled implementations. Run it against a custom store to check your implementation.
 
-Two rules are easy to get wrong and are pinned by the suite:
+The suite checks two details that store implementations need to preserve:
 
-- **Every read takes `now`**; a store must never consult the wall clock, or a frozen
-  clock in tests stops governing expiry.
-- **`limit`/`offset` count rows that survive filtering.** Pushing them into SQL ahead
-  of the expiry and subject filters silently drops resources the caller can reach.
+- Every read accepts `now`. Stores must use that value instead of reading the wall
+  clock so tests can control expiry.
+- `limit` and `offset` count rows after expiry and subject filters run. Applying them
+  earlier in SQL can omit resources the caller can access.
 
 ### The default implementation
 
-`betterAuthGrantStore` talks to `ctx.context.adapter`, so it inherits whichever
-database Better Auth is configured with. Two constraints keep it portable across every
-adapter:
+`betterAuthGrantStore` uses `ctx.context.adapter`, so it works with the database
+configured in Better Auth. Its queries follow two rules for adapter compatibility:
 
-1. **No `OR` connectors.** Adapters differ in how they combine `AND` and `OR` groups.
-   Every predicate is a pure conjunction; the one genuinely disjunctive filter
-   (`expiresAt IS NULL OR expiresAt > now`) is applied in memory over an already
-   narrow result set.
-2. **No composite subject predicate.** `(type, id)` pairs are narrowed in SQL with two
-   independent `IN` clauses — a superset — and matched exactly in memory. Subject
-   counts per request are single digits.
+1. Queries do not use `OR` connectors because adapters combine `AND` and `OR` groups
+   differently. The store applies `expiresAt IS NULL OR expiresAt > now` in memory
+   after SQL has narrowed the result set.
+2. Queries do not use composite subject predicates. The store narrows type and ID with
+   two independent `IN` clauses, then matches each pair in memory. This SQL query may
+   return extra rows, but subject counts per request are usually small.
 
-Because both filters run after the query, `listSubjectGrants` cannot simply hand
-`limit` to SQL — it walks the result in chunks until it has enough live rows.
+Because both filters run after the query, `listSubjectGrants` reads results in chunks
+until it has enough live rows. Passing `limit` straight to SQL would return too few
+rows.
 
 ### Bringing your own
 
@@ -563,7 +550,7 @@ robrac({
 });
 ```
 
-Point robrac at an existing table, hand-tuned SQL, or a cache in front of either.
+Custom stores can use an existing table, database-specific SQL or a cache.
 
 ### Schema
 
@@ -578,7 +565,7 @@ Point robrac at an existing table, hand-tuned SQL, or a cache in front of either
 | `role`                 | text |                                    |
 | `grantedBySubjectType` | text | nullable                           |
 | `grantedBySubjectId`   | text | nullable                           |
-| `expiresAt`            | date | nullable — `null` never expires    |
+| `expiresAt`            | date | nullable; `null` never expires     |
 | `createdAt`            | date |                                    |
 | `updatedAt`            | date |                                    |
 
@@ -612,9 +599,10 @@ CREATE INDEX robrac_grant_lookup_idx
   ON robrac_grant (scope, resource_type, subject_type, subject_id);
 ```
 
-`NULLS NOT DISTINCT` is not optional. `scope` is nullable, and by default SQL treats
-two NULLs as distinct — so without it the unique index silently stops constraining
-anything in single-tenant deployments, where _every_ row has `scope = NULL`.
+The unique index needs `NULLS NOT DISTINCT` because `scope` is nullable. By default,
+SQL treats two `NULL` values as distinct. Without this clause, the index does not
+prevent duplicate grants in a single-tenant deployment because every row has
+`scope = NULL`.
 
 On PostgreSQL 14 and below, or on MySQL, index a coalesced expression instead:
 
@@ -626,8 +614,8 @@ CREATE UNIQUE INDEX robrac_grant_unique_idx
   );
 ```
 
-The unique index closes the upsert race that the store's transaction only narrows.
-The second index is the one the hot path actually uses.
+The unique index prevents concurrent upserts from creating duplicate grants. The
+second index supports grant lookups during access checks.
 
 ---
 
@@ -652,16 +640,16 @@ robrac({
 });
 ```
 
-`decision.roles` carries provenance — which roles were explicit, which were computed,
-which were inherited and from where — which is usually the difference between an
-audit log and an audit log you can act on.
+`decision.roles` records whether each role was explicit, computed or inherited. For
+inherited roles, it also records the source. This information helps explain why an
+access decision was made.
 
 ---
 
 ## Testing
 
-`robrac/testing` gives you an engine with an in-memory store and a frozen
-clock, so authorization rules can be unit tested without a database:
+`robrac/testing` creates an engine with an in-memory store and a controllable clock.
+Use it to test authorization rules without a database:
 
 ```ts
 import { createTestRobrac, subjects } from 'robrac/testing';
@@ -702,8 +690,9 @@ pnpm test
 
 ## Using it without Better Auth
 
-The engine has no HTTP or Better Auth dependency. Background workers, cron jobs and
-services on other frameworks can import it directly and get byte-identical decisions:
+The engine has no HTTP or Better Auth dependency. Background workers, scheduled jobs
+and services on other frameworks can import it directly and use the same decision
+logic:
 
 ```ts
 import { createRobrac } from 'robrac';
@@ -715,21 +704,21 @@ const robrac = createRobrac({ resources, store });
 
 ## Design notes
 
-**Why not store a denormalized `subject` key?** A single `type:id` column would allow
-one `IN` clause instead of two. It would also make the table unreadable in a database
-console and impossible to index per subject type. The superset-then-filter approach
-costs nothing at real subject counts.
+**Why not store a combined `subject` key?** A single `type:id` column would allow one
+`IN` clause instead of two. It would make rows harder to read in a database console
+and prevent indexes for a specific subject type. robrac instead queries a superset and
+matches exact subject pairs in memory. Requests usually have only a few subjects.
 
-**Why is `data` absent from HTTP responses?** Because the moment an authorization
-endpoint starts returning rows, it becomes a second, unreviewed read path with its own
-redaction rules. robrac answers questions about access; your API serves data.
+**Why is `data` absent from HTTP responses?** Returning resource data would create
+another read path with separate redaction rules. robrac answers access questions.
+Your API returns the data.
 
-**Why is anti-escalation on by default?** Because "may share" and "may delete" are
-different permissions, and every system that conflates them eventually lets an editor
-promote themselves. Opt out with `escalation: 'allow'` if your roles are flat.
+**Why is anti-escalation on by default?** "May share" and "may delete" are different
+permissions. Without the check, an editor with sharing rights could grant themselves a
+more powerful role. Set `escalation: 'allow'` if your roles are flat.
 
-**Why does an empty permission request fail?** Because `permissions: {}` is almost
-always a bug in the caller, and the failure mode of the alternative is silent.
+**Why does an empty permission request fail?** `permissions: {}` usually means the
+caller built the request incorrectly. Treating it as allowed would hide the mistake.
 
 ---
 
@@ -741,11 +730,11 @@ pnpm install
 pnpm verify      # lint, typecheck, test, build
 ```
 
-The test suite runs on `node --test` against `src/` directly — no build step, no test
-framework.
+The test suite uses `node --test` and runs against `src/` directly. It needs no build
+step or test framework.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the changeset and release conventions —
-notably that while robrac is pre-1.0, a breaking change takes a **`minor`** bump.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for changeset and release conventions. While
+robrac is pre-1.0, a breaking change requires a `minor` version bump.
 
 ## Changelog
 
