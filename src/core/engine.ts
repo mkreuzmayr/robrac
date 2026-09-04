@@ -549,7 +549,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
           ? entry.definition.inheritRole({ parent, role: applied.role })
           : // Default: carry the role over when the child declares a role of
             // the same name. Anything else is dropped rather than guessed.
-            entry.roles[applied.role]
+            Object.hasOwn(entry.roles, applied.role)
             ? applied.role
             : null;
 
@@ -904,7 +904,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
   /* ---------------------------------------------------------------------- */
 
   function assertKnownRole(entry: CompiledResource, role: string): void {
-    if (!entry.roles[role]) {
+    if (!Object.hasOwn(entry.roles, role)) {
       throw new RobracError(
         'UNKNOWN_ROLE',
         `Unknown role "${role}" for resource type "${entry.definition.type}".`
@@ -1249,7 +1249,9 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       return null;
     }
 
-    const role = entry.roles[roleName];
+    const role = Object.hasOwn(entry.roles, roleName)
+      ? entry.roles[roleName]
+      : undefined;
     if (!role) {
       return null;
     }

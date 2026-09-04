@@ -211,7 +211,9 @@ export function assertResourceIsConsistent(
 ): void {
   for (const [roleName, facets] of Object.entries(roleStatements)) {
     for (const [facet, actions] of Object.entries(facets)) {
-      const declared = definition.statements[facet];
+      const declared = Object.hasOwn(definition.statements, facet)
+        ? definition.statements[facet]
+        : undefined;
       if (!declared) {
         throw new RobracError(
           'INVALID_CONFIGURATION',
