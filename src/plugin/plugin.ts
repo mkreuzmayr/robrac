@@ -319,14 +319,17 @@ export function robrac<const TRegistry extends ResourceRegistry>(
       ? []
       : [
           {
-            pathMatcher: (path: string) => path.startsWith('/robrac/grants/'),
+            pathMatcher: (path: string) =>
+              path.startsWith('/robrac/grants/') &&
+              path !== '/robrac/grants/list',
             window: options.rateLimit?.write?.window ?? 60,
             max: options.rateLimit?.write?.max ?? 30,
           },
           {
             pathMatcher: (path: string) =>
               path.startsWith('/robrac/') &&
-              !path.startsWith('/robrac/grants/'),
+              (!path.startsWith('/robrac/grants/') ||
+                path === '/robrac/grants/list'),
             window: options.rateLimit?.read?.window ?? 10,
             max: options.rateLimit?.read?.max ?? 120,
           },
