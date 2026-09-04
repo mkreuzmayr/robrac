@@ -108,7 +108,8 @@ export type RobracPluginOptions<TRegistry extends ResourceRegistry> = {
    *
    * This is hygiene, not a security control: a removed member's grants are
    * already inert, because subject resolution can no longer produce that
-   * member id. Both flags default to enabled.
+   * member id. Enabled by default only with the built-in organization scope
+   * resolver. Custom scope resolvers must opt in when their IDs are organizations.
    */
   cleanup?: {
     onMemberRemoved?: boolean;
@@ -222,12 +223,15 @@ export function robrac<const TRegistry extends ResourceRegistry>(
   // is only meaningful when scopes are in play. Under `scope: 'disabled'`
   // every grant is stored with a null scope, so a scope-wide revoke keyed on
   // an organization id would either match nothing or — far worse — be widened
-  // to "every grant in the database". Leave them off.
-  const scopesAreOrganizations = scopeMode !== 'disabled';
+  // to "every grant in the database". Leave them off. Custom scope resolvers
+  // may use a separate ID namespace, so their cleanup needs an explicit opt-in.
+  const usesOrganizationScope = resolveScope === activeOrganizationScope;
   const cleanupMemberRemoved =
-    scopesAreOrganizations && options.cleanup?.onMemberRemoved !== false;
+    scopeMode !== 'disabled' &&
+    (options.cleanup?.onMemberRemoved ?? usesOrganizationScope);
   const cleanupOrgDeleted =
-    scopesAreOrganizations && options.cleanup?.onOrganizationDeleted !== false;
+    scopeMode !== 'disabled' &&
+    (options.cleanup?.onOrganizationDeleted ?? usesOrganizationScope);
 
   // The engine needs the Better Auth adapter, which only exists once the auth
   // context has been created. `init` fills this in before any request runs.

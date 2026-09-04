@@ -444,8 +444,11 @@ records from several tables.
 
 - Set `schema.grant.scopeReferences` to make `scope` a foreign key and cascade tenant
   deletions in the database.
-- The plugin attempts cleanup after `/organization/remove-member`,
-  `/organization/leave` and `/organization/delete`.
+- With the built-in organization scope resolver, the plugin attempts cleanup after
+  `/organization/remove-member`, `/organization/leave` and `/organization/delete`.
+  Custom scope resolvers must explicitly enable `cleanup.onMemberRemoved` and
+  `cleanup.onOrganizationDeleted` if their scopes are organization IDs. Cleanup
+  stays disabled in single-tenant mode.
 - A removed member's grants cannot provide access because subject resolution no
   longer returns that member ID. Cleanup removes the unused rows.
 
