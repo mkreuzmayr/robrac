@@ -537,8 +537,9 @@ configured in Better Auth. Its queries follow two rules for adapter compatibilit
    two independent `IN` clauses, then matches each pair in memory. This SQL query may
    return extra rows, but subject counts per request are usually small.
 
-Because both filters run after the query, `listSubjectGrants` reads results in chunks
-until it has enough live rows. Passing `limit` straight to SQL would return too few
+All grant reads use explicit pages to avoid Better Auth's default query limit.
+Because both filters run after the query, `listSubjectGrants` reads pages until it
+has enough live rows. Passing `limit` straight to SQL would return too few
 rows.
 
 ### Bringing your own

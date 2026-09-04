@@ -6,6 +6,7 @@ import { memoryAdapter } from 'better-auth/adapters/memory';
 
 import {
   betterAuthGrantStore,
+  createRobrac,
   defineResource,
   memoryGrantStore,
   robrac,
@@ -26,20 +27,23 @@ const NOW = new Date('2026-01-01T00:00:00Z');
  * all. The memory adapter stands in for Postgres; the store never sees the
  * difference, which is the whole point.
  */
-async function betterAuthStore(): Promise<GrantStore> {
+async function betterAuthStore(
+  seed: Record<string, unknown>[] = []
+): Promise<GrantStore> {
   // The memory adapter expects one array per model up front.
   const db = {
     user: [],
     session: [],
     account: [],
     verification: [],
-    robracGrant: [],
+    robracGrant: seed,
   };
 
   const auth = betterAuth({
     baseURL: 'http://localhost:3000',
     secret: 'robrac-test-secret-robrac-test-secret',
     database: memoryAdapter(db),
+    advanced: { database: { defaultFindManyLimit: 2 } },
     plugins: [
       robrac({
         scope: 'disabled',
@@ -539,3 +543,96 @@ function storeContract(name: string, create: () => Promise<GrantStore>) {
 
 storeContract('memory', () => Promise.resolve(memoryGrantStore()));
 storeContract('better-auth adapter', betterAuthStore);
+
+describe('Better Auth grant pagination', () => {
+  it('reads every page for all grant queries, including offset without limit', async () => {
+    const seed = Array.from({ length: 505 }, (_, index) => ({
+      id: `grant_${index}`,
+      scope: ORG,
+      resourceType: DOC.type,
+      resourceId: DOC.id,
+      subjectType: BOB.type,
+      subjectId: BOB.id,
+      role: `role_${index}`,
+      expiresAt: null,
+      createdAt: new Date(NOW.getTime() + index),
+      updatedAt: NOW,
+    }));
+    const store = await betterAuthStore(seed);
+    assert.equal(
+      (
+        await store.findGrants({
+          scope: ORG,
+          resourceType: DOC.type,
+          resourceIds: [DOC.id],
+          subjects: [BOB],
+          now: NOW,
+        })
+      ).length,
+      505
+    );
+    assert.equal(
+      (
+        await store.listResourceGrants({
+          scope: ORG,
+          resource: DOC,
+          now: NOW,
+          includeExpired: true,
+        })
+      ).length,
+      505
+    );
+    const query = {
+      scope: ORG,
+      resourceType: DOC.type,
+      subjects: [BOB],
+      now: NOW,
+    };
+    assert.equal((await store.listSubjectGrants(query)).length, 505);
+    const remaining = await store.listSubjectGrants({ ...query, offset: 502 });
+    assert.deepEqual(
+      remaining.map((grant) => grant.role),
+      ['role_502', 'role_503', 'role_504']
+    );
+    assert.deepEqual(
+      (await store.listSubjectGrants({ ...query, offset: 502, limit: 2 })).map(
+        (grant) => grant.role
+      ),
+      ['role_502', 'role_503']
+    );
+    assert.deepEqual(await store.listSubjectGrants({ ...query, limit: 0 }), []);
+
+    const engine = createRobrac({
+      store,
+      resources: {
+        document: defineResource({
+          type: 'document',
+          statements: { document: ['read'] },
+          roles: Object.fromEntries(
+            seed.map((grant) => [grant.role, { document: ['read'] }])
+          ),
+          load: ({ id }) => ({ id }),
+          scope: () => ORG,
+          manage: { document: ['read'] },
+        }),
+      },
+    });
+    await engine.grants.set({
+      type: DOC.type,
+      id: DOC.id,
+      scope: ORG,
+      subject: BOB,
+      roles: ['role_504'],
+    });
+    const replaced = await store.listResourceGrants({
+      scope: ORG,
+      resource: DOC,
+      now: NOW,
+      includeExpired: true,
+    });
+    assert.deepEqual(
+      replaced.map((grant) => grant.role),
+      ['role_504']
+    );
+  });
+});
