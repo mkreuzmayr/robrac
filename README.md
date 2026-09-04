@@ -285,6 +285,10 @@ override: ({ data }) => (data.legalHold ? 'deny' : null),
 
 `'deny'` clears every action. `'allow'` grants every declared action and skips the
 anti-escalation check, which lets a break-glass administrator grant any role.
+Both skip grant reads, computed roles and parent traversal for that resource,
+so `roles` and `effectiveRoles` are empty on overridden decisions.
+A deny also blocks custom `manage` predicates. An overridden ancestor contributes
+no roles to its children; a child's own grants and override still apply.
 
 ### Resource hierarchy
 

@@ -335,7 +335,8 @@ describe('override', () => {
 
     assert.equal(decision.found, true);
     assert.equal(decision.override, 'deny');
-    assert.deepEqual(decision.effectiveRoles, ['owner']);
+    // Overrides skip role evaluation, including the creator's computed role.
+    assert.deepEqual(decision.effectiveRoles, []);
     assert.equal(decision.permissions.document.read, false);
     assert.equal(decision.permissions.document.delete, false);
   });
