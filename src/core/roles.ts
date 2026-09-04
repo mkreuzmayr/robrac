@@ -17,6 +17,11 @@ const ROLE_EXTENDS = Symbol.for('robrac.role.extends');
 /** Action wildcard: grants every action declared for that facet. */
 export const ALL_ACTIONS = '*';
 
+/** Internal dictionaries must not inherit names such as constructor. */
+function dictionary<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 type ExtendedRole = {
   statements: Statements;
   [ROLE_EXTENDS]: readonly string[];
@@ -119,8 +124,8 @@ function mergeInto(
 export function normalizeRoles(
   roles: Record<string, RoleInput>
 ): Record<string, NormalizedRole> {
-  const own: Record<string, Record<string, string[]>> = {};
-  const parents: Record<string, readonly string[]> = {};
+  const own = dictionary<Record<string, string[]>>();
+  const parents = dictionary<readonly string[]>();
 
   for (const [name, role] of Object.entries(roles)) {
     const statements = readStatements(role);
@@ -137,11 +142,11 @@ export function normalizeRoles(
       }
     }
 
-    own[name] = mergeInto({}, statements);
+    own[name] = mergeInto(dictionary<string[]>(), statements);
     parents[name] = readExtends(role);
   }
 
-  const resolved: Record<string, NormalizedRole> = {};
+  const resolved = dictionary<NormalizedRole>();
   const resolving = new Set<string>();
 
   const resolve = (name: string): NormalizedRole => {
@@ -165,7 +170,7 @@ export function normalizeRoles(
     }
 
     resolving.add(name);
-    const effective: Record<string, string[]> = {};
+    const effective = dictionary<string[]>();
     for (const parent of parents[name] ?? []) {
       mergeInto(effective, resolve(parent).effective);
     }
@@ -174,8 +179,8 @@ export function normalizeRoles(
 
     const role: NormalizedRole = {
       name,
-      own: ownStatements,
-      effective,
+      own: { ...ownStatements },
+      effective: { ...effective },
       extends: parents[name] ?? [],
     };
     resolved[name] = role;
@@ -186,7 +191,7 @@ export function normalizeRoles(
     resolve(name);
   }
 
-  return resolved;
+  return { ...resolved };
 }
 
 /**
@@ -199,15 +204,17 @@ export function buildPermissionMatrix<TStatements extends Statements>(
   roles: Record<string, NormalizedRole>,
   effectiveRoleNames: readonly string[]
 ): PermissionMatrix<TStatements> {
-  const granted: Record<string, Set<string>> = {};
+  const granted = dictionary<Set<string>>();
 
   for (const name of effectiveRoleNames) {
-    const role = roles[name];
+    const role = Object.hasOwn(roles, name) ? roles[name] : undefined;
     if (!role) {
       continue;
     }
     for (const [facet, actions] of Object.entries(role.effective)) {
-      const declared = statements[facet];
+      const declared = Object.hasOwn(statements, facet)
+        ? statements[facet]
+        : undefined;
       if (!declared) {
         continue;
       }
@@ -241,15 +248,14 @@ function materialize<TStatements extends Statements>(
   statements: TStatements,
   allows: (facet: string, action: string) => boolean
 ): PermissionMatrix<TStatements> {
-  const matrix: PermissionTable = {};
-  for (const [facet, actions] of Object.entries(statements)) {
-    const row: Record<string, boolean> = {};
-    for (const action of actions) {
-      row[action] = allows(facet, action);
-    }
-    matrix[facet] = row;
-  }
-  return matrix as PermissionMatrix<TStatements>;
+  return Object.fromEntries(
+    Object.entries(statements).map(([facet, actions]) => [
+      facet,
+      Object.fromEntries(
+        actions.map((action) => [action, allows(facet, action)])
+      ),
+    ])
+  ) as PermissionMatrix<TStatements>;
 }
 
 type ActionRequest =
@@ -300,13 +306,13 @@ export function checkPermissions<TStatements extends Statements>(
     }
     const { actions, connector: actionConnector } =
       normalizeActionRequest(rawActions);
-    const row = table[facet];
+    const row = Object.hasOwn(table, facet) ? table[facet] : undefined;
+    const allows = (action: string) =>
+      row !== undefined && Object.hasOwn(row, action) && row[action] === true;
 
     const satisfied =
       actions.length > 0 &&
-      (actionConnector === 'OR'
-        ? actions.some((action) => row?.[action] === true)
-        : actions.every((action) => row?.[action] === true));
+      (actionConnector === 'OR' ? actions.some(allows) : actions.every(allows));
 
     if (satisfied) {
       if (connector === 'OR') {
