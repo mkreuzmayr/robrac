@@ -61,10 +61,13 @@ export function defaultSubjectResolver(
     memberModel?: string;
     /** Schema key of the organization plugin's team-member model. */
     teamMemberModel?: string;
+    /** Schema key of the organization plugin's team model. */
+    teamModel?: string;
   } = {}
 ): SubjectResolver {
   const memberModel = options.memberModel ?? 'member';
   const teamMemberModel = options.teamMemberModel ?? 'teamMember';
+  const teamModel = options.teamModel ?? 'team';
 
   return async ({ user, adapter, scope }) => {
     const subjects: SubjectRef[] = [{ type: USER_SUBJECT, id: user.id }];
@@ -81,9 +84,8 @@ export function defaultSubjectResolver(
       ],
     });
 
-    // No membership means no access to anything in this tenant. Returning just
-    // the user subject is correct: grants are stored per member, so nothing
-    // will match, and computed roles still see the empty membership.
+    // Without membership, omit member and team identities. User grants and
+    // computed roles can still provide access according to the app's rules.
     if (!member) {
       return subjects;
     }
@@ -91,12 +93,40 @@ export function defaultSubjectResolver(
     subjects.push({ type: MEMBER_SUBJECT, id: member.id });
 
     if (options.includeTeams === true) {
-      const teamMemberships = await adapter.findMany<{ teamId: string }>({
-        model: teamMemberModel,
-        where: [{ field: 'userId', value: user.id }],
-      });
-      for (const membership of teamMemberships) {
-        subjects.push({ type: TEAM_SUBJECT, id: membership.teamId });
+      const seen = new Set<string>();
+      const pageSize = 500;
+      let offset = 0;
+      while (true) {
+        const memberships = await adapter.findMany<{ teamId: string }>({
+          model: teamMemberModel,
+          where: [{ field: 'userId', value: user.id }],
+          limit: pageSize,
+          offset,
+          sortBy: { field: 'id', direction: 'asc' },
+        });
+        if (memberships.length === 0) break;
+        const teamIds = [
+          ...new Set(memberships.map((membership) => membership.teamId)),
+        ];
+        // Team memberships have no organizationId. Check the team's tenant
+        // before exposing its identity to grants or application callbacks.
+        const teams = await adapter.findMany<{ id: string }>({
+          model: teamModel,
+          where: [
+            { field: 'id', value: teamIds, operator: 'in' },
+            { field: 'organizationId', value: scope },
+          ],
+          limit: teamIds.length,
+          sortBy: { field: 'id', direction: 'asc' },
+        });
+        for (const team of teams) {
+          if (!seen.has(team.id)) {
+            seen.add(team.id);
+            subjects.push({ type: TEAM_SUBJECT, id: team.id });
+          }
+        }
+        offset += memberships.length;
+        if (memberships.length < pageSize) break;
       }
     }
 

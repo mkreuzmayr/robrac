@@ -324,7 +324,8 @@ robrac({
 
 The default resolver returns the user and their membership in the active organization.
 Pass `defaultSubjectResolver({ includeTeams: true })` to include teams from the
-organization plugin.
+organization plugin. Only teams belonging to the resolved organization are included;
+memberships are paged so the adapter's default query limit cannot omit teams.
 
 robrac combines roles from every subject identity. A caller receives both their
 personal grants and their team grants.
