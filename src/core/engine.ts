@@ -263,6 +263,17 @@ export type RobracEngine<TRegistry extends ResourceRegistry> = ReturnType<
   typeof createRobrac<TRegistry>
 >;
 
+/** Validate the recursion bound before requests can traverse parent chains. */
+export function resolveMaxInheritanceDepth(depth = 5): number {
+  if (!Number.isSafeInteger(depth) || depth < 0) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      'maxInheritanceDepth must be a non-negative safe integer.'
+    );
+  }
+  return depth;
+}
+
 /**
  * Build a framework-agnostic authorization engine.
  *
@@ -275,7 +286,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
   options: RobracEngineOptions<TRegistry>
 ) {
   const scopeMode = options.scope ?? 'required';
-  const maxDepth = options.maxInheritanceDepth ?? 5;
+  const maxDepth = resolveMaxInheritanceDepth(options.maxInheritanceDepth);
   const escalation = options.escalation ?? 'deny';
   const now = options.now ?? (() => new Date());
 

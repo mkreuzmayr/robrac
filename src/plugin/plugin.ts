@@ -7,7 +7,11 @@ import {
 import type { BetterAuthPlugin } from 'better-auth/types';
 import { z } from 'zod';
 
-import { compileResources, createRobrac } from '../core/engine.ts';
+import {
+  compileResources,
+  createRobrac,
+  resolveMaxInheritanceDepth,
+} from '../core/engine.ts';
 import type {
   PermissionRequestOf,
   ResourceRegistry,
@@ -209,6 +213,7 @@ export function robrac<const TRegistry extends ResourceRegistry>(
   options: RobracPluginOptions<TRegistry>
 ) {
   const scopeMode = options.scope ?? 'required';
+  resolveMaxInheritanceDepth(options.maxInheritanceDepth);
 
   // Fail at boot, not at the first authorization check: role cycles, roles
   // that reference undeclared actions, and resources missing a scope() under
