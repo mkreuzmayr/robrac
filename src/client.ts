@@ -1,10 +1,10 @@
 import type { BetterAuthOptions } from 'better-auth';
 import { InferServerPlugin } from 'better-auth/client/plugins';
 
-import type { RobracPluginId } from './plugin/plugin.ts';
+import type { RobracPluginId } from './plugin/id.ts';
 
 export type { SerializedDecision, SubjectDescriptor } from './plugin/infer.ts';
-export { ROBRAC_PLUGIN_ID, type RobracPluginId } from './plugin/plugin.ts';
+export { ROBRAC_PLUGIN_ID, type RobracPluginId } from './plugin/id.ts';
 
 /**
  * Client counterpart of the robrac server plugin.
