@@ -27,6 +27,7 @@ import type {
 import { betterAuthGrantStore } from '../store/better-auth.ts';
 import type { BetterAuthAdapterLike } from '../store/better-auth.ts';
 import type { GrantStore } from '../store/types.ts';
+import { ROBRAC_PLUGIN_ID } from './id.ts';
 import type {
   AccessBatchBody,
   AccessibleIdsBody,
@@ -47,9 +48,7 @@ import {
   MEMBER_SUBJECT,
 } from './subjects.ts';
 import type { ScopeResolver, SubjectResolver } from './subjects.ts';
-
-export const ROBRAC_PLUGIN_ID = 'robrac';
-export type RobracPluginId = typeof ROBRAC_PLUGIN_ID;
+export { ROBRAC_PLUGIN_ID, type RobracPluginId } from './id.ts';
 
 export type RobracPluginOptions<TRegistry extends ResourceRegistry> = {
   /** Resource types, keyed by their `type`. */
