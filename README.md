@@ -49,10 +49,11 @@ Kysely, MongoDB or a raw connection without ORM-specific code in robrac.
 ## Install
 
 ```bash
-pnpm add robrac
+pnpm add robrac better-auth
 ```
 
-`better-auth` `^1.6` is a peer dependency. `zod` `^4` is a regular dependency and
+`better-auth` `^1.6` is an optional peer dependency, required for the server and
+browser plugins. `zod` `^4` is a regular dependency and
 can be deduplicated with Better Auth's copy.
 
 robrac ships as ESM with generated types and imports no `node:` built-ins. It runs on
@@ -690,15 +691,21 @@ pnpm test
 
 ## Using it without Better Auth
 
-The engine has no HTTP or Better Auth dependency. Background workers, scheduled jobs
-and services on other frameworks can import it directly and use the same decision
-logic:
+The `robrac/core` entrypoint has no HTTP or Better Auth dependency. Background
+workers and services on other frameworks can use it without installing Better Auth.
+`robrac/testing` also works without that peer. Install `better-auth` explicitly when
+using the plugins from `robrac` or `robrac/client`.
+
+For a local prototype:
 
 ```ts
-import { createRobrac } from 'robrac';
+import { createRobrac, memoryGrantStore } from 'robrac/core';
 
-const robrac = createRobrac({ resources, store });
+const robrac = createRobrac({ resources, store: memoryGrantStore() });
 ```
+
+Use a durable `GrantStore` for production. Set `scope: 'disabled'` if the application
+has no tenants.
 
 ---
 

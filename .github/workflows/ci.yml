@@ -74,7 +74,7 @@ jobs:
           retention-days: 7
 
   # Installs the packed tarball into a throwaway project on every Node version
-  # `engines.node` claims to support, and imports all three entrypoints from outside
+  # `engines.node` claims to support, and imports all entrypoints from outside
   # the repo.
   consume:
     name: consume (node ${{ matrix.node }})
