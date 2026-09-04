@@ -1,4 +1,4 @@
-// Installs a packed robrac tarball into a throwaway project and exercises all three
+// Installs a packed robrac tarball into a throwaway project and exercises all public
 // entrypoints from *outside* the repo — the only way to catch a broken `exports` map,
 // a missing file in `files`, or a runtime that the published ESM does not actually run
 // on. Run as: node scripts/smoke-consumer.mjs <path-to-tarball>
@@ -44,8 +44,63 @@ run('npm', [
   '--no-audit',
   '--no-fund',
   resolve(tarball),
-  'better-auth@^1.6.0',
+  'typescript@7.0.2',
 ]);
+
+writeFileSync(
+  join(dir, 'core.mjs'),
+  `
+import assert from 'node:assert/strict';
+import { createRobrac, defineResource, memoryGrantStore } from 'robrac/core';
+import { createTestRobrac } from 'robrac/testing';
+assert.throws(() => import.meta.resolve('better-auth'), { code: 'ERR_MODULE_NOT_FOUND' });
+const resources = { document: defineResource({
+  type: 'document', statements: { document: ['read'] },
+  roles: { viewer: { document: ['read'] } },
+  load: ({ id }) => ({ id }), manage: { document: ['read'] },
+}) };
+const engine = createRobrac({ resources, store: memoryGrantStore(), scope: 'disabled' });
+const subject = { type: 'user', id: 'alice' };
+await engine.grants.grant({ type: 'document', id: 'doc', subject, role: 'viewer' });
+assert.equal(await engine.check({ type: 'document', id: 'doc', subjects: [subject], permissions: { document: ['read'] } }), true);
+assert.equal(await createTestRobrac({ resources, scope: 'disabled' }).check({ type: 'document', id: 'doc', subjects: [subject], permissions: { document: ['read'] } }), false);
+console.log('standalone core ok');
+`
+);
+run('node', ['core.mjs']);
+
+writeFileSync(
+  join(dir, 'core-types.mts'),
+  `
+import { createRobrac, defineResource, memoryGrantStore } from 'robrac/core';
+import { createTestRobrac } from 'robrac/testing';
+const resources = { document: defineResource({
+  type: 'document', statements: { document: ['read'] },
+  roles: { viewer: { document: ['read'] } },
+  load: ({ id }) => ({ id }), manage: { document: ['read'] },
+}) };
+const engine = createRobrac({ resources, store: memoryGrantStore(), scope: 'disabled' });
+const decision = await engine.evaluate({ type: 'document', id: 'doc', subjects: [] });
+const readable: boolean = decision.permissions.document.read;
+// @ts-expect-error undeclared action
+const bad = decision.permissions.document.delete;
+createTestRobrac({ resources, scope: 'disabled' });
+`
+);
+run('node', [
+  'node_modules/typescript/bin/tsc',
+  '--noEmit',
+  '--strict',
+  '--skipLibCheck',
+  'false',
+  '--module',
+  'NodeNext',
+  '--target',
+  'ES2022',
+  'core-types.mts',
+]);
+
+run('npm', ['install', '--no-audit', '--no-fund', 'better-auth@^1.6.0']);
 
 writeFileSync(
   join(dir, 'smoke.mjs'),
