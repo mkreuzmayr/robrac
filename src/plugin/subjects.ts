@@ -32,8 +32,8 @@ export type ScopeResolver = (args: ScopeResolverArgs) => Promise<Scope> | Scope;
 /**
  * Default scope: the session's active organization.
  *
- * Returns `null` for apps that don't use the organization plugin, which puts
- * robrac into single-tenant mode for that request.
+ * Returns `null` when no organization is active. Required scope mode rejects
+ * this value; single-tenant apps should configure `scope: 'disabled'`.
  */
 export const activeOrganizationScope: ScopeResolver = ({ session }) => {
   const value = session.activeOrganizationId;
