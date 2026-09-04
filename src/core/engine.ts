@@ -257,6 +257,7 @@ type CollectedRoles = {
   data: unknown;
   resource: ResourceRef;
   applied: AppliedRole[];
+  override: 'allow' | 'deny' | null;
 };
 
 export type RobracEngine<TRegistry extends ResourceRegistry> = ReturnType<
@@ -418,13 +419,31 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       return new Map();
     }
 
+    const result = new Map<string, CollectedRoles>();
+    await Promise.all(
+      [...present].map(async ([id, data]) => {
+        const ref: ResourceRef = { type: args.type, id };
+        const override = await entry.definition.override?.({
+          data,
+          resource: ref,
+          scope: args.scope,
+          subjects: args.subjects,
+          context: args.context,
+        });
+        if (override != null) {
+          result.set(id, { data, resource: ref, applied: [], override });
+        }
+      })
+    );
+    const pending = [...present.keys()].filter((id) => !result.has(id));
+
     const grants =
-      args.subjects.length === 0
+      args.subjects.length === 0 || pending.length === 0
         ? []
         : await options.store.findGrants({
             scope: args.scope,
             resourceType: args.type,
-            resourceIds: [...present.keys()],
+            resourceIds: pending,
             subjects: args.subjects,
             now: now(),
           });
@@ -439,10 +458,9 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       }
     }
 
-    const result = new Map<string, CollectedRoles>();
-
     await Promise.all(
-      [...present].map(async ([id, data]) => {
+      pending.map(async (id) => {
+        const data = present.get(id);
         const ref: ResourceRef = { type: args.type, id };
         const applied: AppliedRole[] = (grantsByResource.get(id) ?? []).map(
           (grant) => ({ role: grant.role, origin: 'explicit' as const })
@@ -463,7 +481,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
           applied.push({ role, origin: 'computed' });
         }
 
-        result.set(id, { data, resource: ref, applied });
+        result.set(id, { data, resource: ref, applied, override: null });
       })
     );
 
@@ -488,6 +506,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
 
     await Promise.all(
       [...result].map(async ([id, collected]) => {
+        if (collected.override !== null) return;
         const parent = await entry.definition.parent?.({
           data: collected.data,
           resource: collected.resource,
@@ -646,39 +665,27 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
 
     const decisions = new Map<string, DecisionFor<TRegistry, TType>>();
 
-    await Promise.all(
-      [...new Set(args.ids)].map(async (id) => {
-        const ref: ResourceRef = { type: args.type, id };
-        const found = collected.get(id);
+    for (const id of new Set(args.ids)) {
+      const ref: ResourceRef = { type: args.type, id };
+      const found = collected.get(id);
 
-        const override = found
-          ? ((await entry.definition.override?.({
-              data: found.data,
-              resource: ref,
-              scope,
-              subjects: args.subjects,
-              context,
-            })) ?? null)
-          : null;
-
-        const decision = decide(
-          entry,
+      const decision = decide(
+        entry,
+        scope,
+        ref,
+        found,
+        found?.override ?? null
+      ) as DecisionFor<TRegistry, TType>;
+      decisions.set(id, decision);
+      if (args.emit) {
+        options.onDecision?.({
+          subjects: args.subjects,
           scope,
-          ref,
-          found,
-          override
-        ) as DecisionFor<TRegistry, TType>;
-        decisions.set(id, decision);
-        if (args.emit) {
-          options.onDecision?.({
-            subjects: args.subjects,
-            scope,
-            resource: ref,
-            decision,
-          });
-        }
-      })
-    );
+          resource: ref,
+          decision,
+        });
+      }
+    }
 
     return decisions;
   }
@@ -1203,16 +1210,18 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
 
     const manage = entry.definition.manage;
     const allowed =
-      typeof manage === 'function'
-        ? await manage({
-            data: decision.data,
-            resource: decision.resource,
-            scope: decision.scope,
-            subjects: args.actor,
-            context: args.context,
-            permissions: decision.permissions,
-          })
-        : checkPermissions(decision.permissions, manage);
+      decision.override === 'deny'
+        ? false
+        : typeof manage === 'function'
+          ? await manage({
+              data: decision.data,
+              resource: decision.resource,
+              scope: decision.scope,
+              subjects: args.actor,
+              context: args.context,
+              permissions: decision.permissions,
+            })
+          : checkPermissions(decision.permissions, manage);
 
     // A refused grant-management attempt is exactly the kind of event an audit
     // log is for, so it goes through the same reporting path as `check`.
