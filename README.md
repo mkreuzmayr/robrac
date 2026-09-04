@@ -337,6 +337,10 @@ personal grants and their team grants.
 | `'optional'` | Scope is matched when the definition provides it                                |
 | `'disabled'` | Single-tenant; scope is always `null`                                           |
 
+With `'disabled'`, robrac skips `resolveScope` and passes `null` to
+`resolveSubjects`. The default subject resolver returns only the user, even if the
+session has an active organization. No organization tables are needed.
+
 With `'required'`, robrac checks the scope before it applies roles or permissions. A
 resource in another scope reads as not found.
 

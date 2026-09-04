@@ -286,11 +286,14 @@ export function robrac<const TRegistry extends ResourceRegistry>(
       auth: ctx.context,
     };
 
-    const scope = await resolveScope({
-      user: session.user,
-      session: session.session,
-      context,
-    });
+    const scope =
+      scopeMode === 'disabled'
+        ? null
+        : await resolveScope({
+            user: session.user,
+            session: session.session,
+            context,
+          });
 
     const subjects = await resolveSubjects({
       user: session.user,
