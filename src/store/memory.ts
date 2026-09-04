@@ -28,7 +28,8 @@ export function memoryGrantStore(
   let counter = 0;
   const generateId =
     options.generateId ?? (() => `grant_${++counter}_${Date.now()}`);
-  const grants = new Map<string, Grant>(
+  let revision = 0;
+  let grants = new Map<string, Grant>(
     (options.seed ?? []).map((grant) => [grant.id, grant])
   );
 
@@ -42,17 +43,35 @@ export function memoryGrantStore(
         deleted++;
       }
     }
+    if (deleted > 0) revision++;
     return deleted;
   };
 
   const store: GrantStore & { all(): Grant[]; clear(): void } = {
     all: list,
-    clear: () => grants.clear(),
+    clear: () => {
+      if (grants.size > 0) revision++;
+      grants.clear();
+    },
 
-    // A single in-process map is already atomic with respect to `await`
-    // boundaries, so the transaction is just a pass-through that keeps the
-    // engine's `setRoles` on the same code path as a real database.
-    transaction: (run) => run(store),
+    async transaction(run) {
+      const initialRevision = revision;
+      const snapshot = memoryGrantStore({
+        seed: structuredClone(list()),
+        generateId,
+      });
+      const result = await run(snapshot);
+      // Other writes can run while the callback awaits. Reject a stale
+      // snapshot instead of overwriting those committed changes.
+      if (revision !== initialRevision) {
+        throw new Error(
+          'Memory grant transaction conflict. Retry the transaction.'
+        );
+      }
+      grants = new Map(snapshot.all().map((grant) => [grant.id, grant]));
+      revision++;
+      return result;
+    },
 
     findGrants({ scope, resourceType, resourceIds, subjects, now }) {
       const ids = new Set(resourceIds);
@@ -123,6 +142,7 @@ export function memoryGrantStore(
           updatedAt: now,
         };
         grants.set(updated.id, updated);
+        revision++;
         return Promise.resolve(updated);
       }
 
@@ -141,6 +161,7 @@ export function memoryGrantStore(
         updatedAt: now,
       };
       grants.set(created.id, created);
+      revision++;
       return Promise.resolve(created);
     },
 

@@ -552,6 +552,11 @@ robrac({
 
 Custom stores can use an existing table, database-specific SQL or a cache.
 
+`memoryGrantStore` runs transactions against a private snapshot and publishes their
+writes only after success. A concurrent write to the parent store causes the
+transaction to reject with a conflict; retry the transaction in that case. Failed
+transactions leave the parent store unchanged.
+
 ### Schema
 
 | Column                 | Type | Notes                              |
