@@ -107,9 +107,9 @@ export type ListGrantsResult = {
   resourceId: string;
   scope: string | null;
   /**
-   * Roles the caller may actually hand out — already filtered by the
-   * anti-escalation rule `grants/grant` enforces. Render these as the choices
-   * in a share dialog.
+   * Roles within the caller's own permissions, filtered by the anti-escalation
+   * rule `grants/grant` enforces. A caller whose own access expires must also
+   * pass an `expiresAt` no later than that.
    */
   availableRoles: string[];
   /** Every role the resource type declares, grantable by this caller or not. */

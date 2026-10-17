@@ -1,6 +1,6 @@
 # Changesets
 
-This folder holds [changesets](https://github.com/changesets/changesets) — one Markdown
+This folder holds [changesets](https://github.com/changesets/changesets): one Markdown
 file per unreleased change, describing the bump it deserves and the changelog line it
 earns. `pnpm changeset` writes one; `pnpm changeset:version` consumes every pending one,
 rewrites `package.json` and `CHANGELOG.md`, and deletes them.

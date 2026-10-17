@@ -1,5 +1,5 @@
 /**
- * robrac — **Ro**le **B**ased **R**esource **A**ccess **C**ontrol.
+ * robrac: **Ro**le **B**ased **R**esource **A**ccess **C**ontrol.
  *
  * A Better Auth plugin for the authorization question organization-level RBAC
  * cannot answer: not "may this member edit recordings", but "may this member
@@ -8,7 +8,7 @@
  * Three things are kept abstract so the package stays free of any host app's
  * data model: subjects (who), scopes (which tenant) and resources (what).
  * Persistence goes through a single {@link GrantStore} interface, whose default
- * implementation rides on Better Auth's own adapter — so robrac works on
+ * implementation rides on Better Auth's own adapter, so robrac works on
  * Drizzle, Prisma, Kysely, MongoDB or a raw connection without a line of
  * ORM-specific code.
  *
@@ -34,6 +34,7 @@ export {
 
 export {
   ROBRAC_ERROR_CODES,
+  RobracArgumentError,
   RobracError,
   type RobracErrorCode,
 } from './core/errors.ts';
@@ -101,12 +102,15 @@ export {
   activeOrganizationScope,
   defaultSubjectResolver,
   MEMBER_SUBJECT,
+  organizationSubjectValidator,
   TEAM_SUBJECT,
   USER_SUBJECT,
   type ScopeResolver,
   type ScopeResolverArgs,
   type SubjectResolver,
   type SubjectResolverArgs,
+  type SubjectValidator,
+  type SubjectValidatorArgs,
 } from './plugin/subjects.ts';
 
 export type {

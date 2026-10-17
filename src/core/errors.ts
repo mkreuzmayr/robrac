@@ -1,7 +1,6 @@
 /**
- * robrac throws plain `RobracError`s from the framework-agnostic core so that
- * the core can be used outside an HTTP request. The Better Auth plugin layer
- * maps them onto `APIError` status codes (see `plugin/endpoints.ts`).
+ * The core throws plain `RobracError`s so it can be used outside an HTTP
+ * request. The Better Auth plugin maps them onto `APIError` status codes.
  */
 export type RobracErrorCode =
   | 'UNKNOWN_RESOURCE_TYPE'
@@ -29,3 +28,11 @@ export const ROBRAC_ERROR_CODES = {
   INVALID_CONFIGURATION: 'Invalid robrac configuration.',
   SCOPE_REQUIRED: 'No scope could be resolved for this request.',
 } as const satisfies Record<RobracErrorCode, string>;
+
+/** A caller passed a malformed argument. Surfaced by the plugin as HTTP 400. */
+export class RobracArgumentError extends RangeError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RobracArgumentError';
+  }
+}

@@ -8,10 +8,7 @@ import type {
   Statements,
 } from './types.ts';
 
-/**
- * Marks a role as inheriting from other roles. A symbol is used so that a
- * facet can legitimately be called `extends` without colliding.
- */
+// A symbol, so that a facet can legitimately be called `extends`.
 const ROLE_EXTENDS = Symbol.for('robrac.role.extends');
 
 /** Action wildcard: grants every action declared for that facet. */
@@ -39,33 +36,25 @@ export function extendRole<const TStatements extends Statements>(
   parents: readonly string[],
   permissions: TStatements
 ): ExtendedRole {
-  return {
-    statements: permissions,
-    [ROLE_EXTENDS]: parents,
-  };
+  return { statements: permissions, [ROLE_EXTENDS]: parents };
 }
 
-/**
- * Distinguish a wrapped role from a plain permission map.
- *
- * Sniffing for a `statements` key alone is not enough: `{ statements: ['read']
- * }` is a legitimate permission map for a facet that happens to be named
- * `statements`, and treating it as a wrapper turns the action array into the
- * statement map and iterates the string `'read'` character by character. So a
- * wrapper is recognised only by the marker `extendRole` sets, or by the
- * `authorize` function every Better Auth role carries.
- */
-function isRoleLike(value: RoleInput): value is { statements: Statements } {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
+/** Own-property lookup, so names like `constructor` never resolve to `Object.prototype`. */
+export function own<T>(
+  record: Readonly<Record<string, T>>,
+  key: string
+): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
 
+// A plain permission map may contain a facet called `statements`, so a wrapper
+// is only recognised by the `extendRole` marker or Better Auth's `authorize`.
+function isRoleWrapper(value: RoleInput): value is { statements: Statements } {
   const candidate = value as {
     statements?: unknown;
     authorize?: unknown;
     [ROLE_EXTENDS]?: unknown;
   };
-
   if (
     typeof candidate.statements !== 'object' ||
     candidate.statements === null ||
@@ -73,81 +62,98 @@ function isRoleLike(value: RoleInput): value is { statements: Statements } {
   ) {
     return false;
   }
-
   return ROLE_EXTENDS in candidate || typeof candidate.authorize === 'function';
 }
 
-function readStatements(role: RoleInput): Statements {
-  return isRoleLike(role) ? role.statements : (role as Statements);
-}
-
-function readExtends(role: RoleInput): readonly string[] {
+function readParents(name: string, role: RoleInput): string[] {
   const value: unknown = (role as Partial<ExtendedRole>)[ROLE_EXTENDS];
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === 'string')
-    : [];
+  if (value === undefined) {
+    return [];
+  }
+  if (
+    !Array.isArray(value) ||
+    value.some((entry) => typeof entry !== 'string')
+  ) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `Role "${name}" must extend an array of role names.`
+    );
+  }
+  return value as string[];
 }
 
-function mergeInto(
-  target: Record<string, string[]>,
-  source: Statements
-): Record<string, string[]> {
-  for (const [facet, actions] of Object.entries(source)) {
-    if (!actions) {
+function readStatements(
+  name: string,
+  role: RoleInput
+): Map<string, Set<string>> {
+  if (typeof role !== 'object' || role === null || Array.isArray(role)) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `Role "${name}" must be a permission map.`
+    );
+  }
+  const statements = isRoleWrapper(role) ? role.statements : role;
+  const result = new Map<string, Set<string>>();
+  for (const [facet, actions] of Object.entries(statements)) {
+    if (actions === undefined) {
       continue;
     }
-    const existing = target[facet];
-    if (existing) {
-      for (const action of actions) {
-        if (!existing.includes(action)) {
-          existing.push(action);
-        }
-      }
-    } else {
-      target[facet] = [...new Set(actions)];
+    if (
+      !Array.isArray(actions) ||
+      actions.some((action) => typeof action !== 'string')
+    ) {
+      throw new RobracError(
+        'INVALID_CONFIGURATION',
+        `Role "${name}" declares facet "${facet}" as ${typeof actions}; it must be an array of actions.`
+      );
     }
+    result.set(facet, new Set(actions as readonly string[]));
   }
-  return target;
+  return result;
+}
+
+function toRecord(
+  statements: Map<string, Set<string>>
+): Record<string, string[]> {
+  return Object.fromEntries(
+    [...statements].map(([facet, actions]) => [facet, [...actions]])
+  );
 }
 
 /**
  * Resolve a role map into {@link NormalizedRole}s with `extends` flattened.
  *
- * Cycles and references to undeclared roles are configuration bugs, so they
- * throw at construction time rather than silently denying access at runtime.
+ * Cycles and references to undeclared roles throw at construction time rather
+ * than silently denying access at runtime.
  */
 export function normalizeRoles(
   roles: Record<string, RoleInput>
 ): Record<string, NormalizedRole> {
-  const own: Record<string, Record<string, string[]>> = {};
-  const parents: Record<string, readonly string[]> = {};
-
+  const declared = new Map<
+    string,
+    { own: Map<string, Set<string>>; parents: string[] }
+  >();
   for (const [name, role] of Object.entries(roles)) {
-    const statements = readStatements(role);
-
-    // Reject a malformed action list here, where the role name is still in
-    // hand. Letting it through produces a nonsense permission map and an error
-    // much later that points nowhere near the actual mistake.
-    for (const [facet, actions] of Object.entries(statements)) {
-      if (actions !== undefined && !Array.isArray(actions)) {
-        throw new RobracError(
-          'INVALID_CONFIGURATION',
-          `Role "${name}" declares facet "${facet}" as ${typeof actions}; it must be an array of actions.`
-        );
-      }
-    }
-
-    own[name] = mergeInto({}, statements);
-    parents[name] = readExtends(role);
+    declared.set(name, {
+      own: readStatements(name, role),
+      parents: readParents(name, role),
+    });
   }
 
-  const resolved: Record<string, NormalizedRole> = {};
+  const resolved = new Map<string, NormalizedRole>();
   const resolving = new Set<string>();
 
-  const resolve = (name: string): NormalizedRole => {
-    const cached = resolved[name];
+  const resolve = (name: string, from?: string): NormalizedRole => {
+    const cached = resolved.get(name);
     if (cached) {
       return cached;
+    }
+    const role = declared.get(name);
+    if (!role) {
+      throw new RobracError(
+        'INVALID_CONFIGURATION',
+        `Role "${from ?? name}" extends unknown role "${name}".`
+      );
     }
     if (resolving.has(name)) {
       throw new RobracError(
@@ -156,62 +162,68 @@ export function normalizeRoles(
       );
     }
 
-    const ownStatements = own[name];
-    if (!ownStatements) {
-      throw new RobracError(
-        'INVALID_CONFIGURATION',
-        `Role "${name}" extends an unknown role.`
+    resolving.add(name);
+    const effective = new Map<string, Set<string>>();
+    const merge = (source: Map<string, Set<string>>) => {
+      for (const [facet, actions] of source) {
+        const bucket = effective.get(facet) ?? new Set<string>();
+        for (const action of actions) {
+          bucket.add(action);
+        }
+        effective.set(facet, bucket);
+      }
+    };
+    for (const parent of role.parents) {
+      merge(
+        new Map(
+          Object.entries(resolve(parent, name).effective).map(
+            ([facet, actions]) => [facet, new Set(actions)]
+          )
+        )
       );
     }
-
-    resolving.add(name);
-    const effective: Record<string, string[]> = {};
-    for (const parent of parents[name] ?? []) {
-      mergeInto(effective, resolve(parent).effective);
-    }
-    mergeInto(effective, ownStatements);
+    merge(role.own);
     resolving.delete(name);
 
-    const role: NormalizedRole = {
+    const normalized: NormalizedRole = {
       name,
-      own: ownStatements,
-      effective,
-      extends: parents[name] ?? [],
+      own: toRecord(role.own),
+      effective: toRecord(effective),
+      extends: [...role.parents],
     };
-    resolved[name] = role;
-    return role;
+    resolved.set(name, normalized);
+    return normalized;
   };
 
-  for (const name of Object.keys(own)) {
+  for (const name of declared.keys()) {
     resolve(name);
   }
-
-  return resolved;
+  return Object.fromEntries(resolved);
 }
 
 /**
- * Build the full allow/deny table for `statements` given the roles a subject
- * effectively holds. Unknown role names are ignored: a grant row can outlive
- * the role that created it, and a dangling role must never widen access.
+ * Every concrete `(facet, action)` pair the named roles confer, restricted to
+ * what `statements` declares. Unknown role names confer nothing: a grant row
+ * can outlive the role that created it, and a dangling role must never widen
+ * access.
  */
-export function buildPermissionMatrix<TStatements extends Statements>(
-  statements: TStatements,
-  roles: Record<string, NormalizedRole>,
-  effectiveRoleNames: readonly string[]
-): PermissionMatrix<TStatements> {
-  const granted: Record<string, Set<string>> = {};
-
-  for (const name of effectiveRoleNames) {
-    const role = roles[name];
+export function grantedActions(
+  statements: Statements,
+  roles: Readonly<Record<string, NormalizedRole>>,
+  roleNames: Iterable<string>
+): Map<string, Set<string>> {
+  const granted = new Map<string, Set<string>>();
+  for (const name of roleNames) {
+    const role = own(roles, name);
     if (!role) {
       continue;
     }
     for (const [facet, actions] of Object.entries(role.effective)) {
-      const declared = statements[facet];
+      const declared = own(statements, facet);
       if (!declared) {
         continue;
       }
-      const bucket = (granted[facet] ??= new Set());
+      const bucket = granted.get(facet) ?? new Set<string>();
       for (const action of actions) {
         if (action === ALL_ACTIONS) {
           for (const declaredAction of declared) {
@@ -221,11 +233,36 @@ export function buildPermissionMatrix<TStatements extends Statements>(
           bucket.add(action);
         }
       }
+      granted.set(facet, bucket);
     }
   }
+  return granted;
+}
 
-  return materialize(statements, (facet, action) =>
-    Boolean(granted[facet]?.has(action))
+function materialize<TStatements extends Statements>(
+  statements: TStatements,
+  allows: (facet: string, action: string) => boolean
+): PermissionMatrix<TStatements> {
+  return Object.fromEntries(
+    Object.entries(statements).map(([facet, actions]) => [
+      facet,
+      Object.fromEntries(
+        actions.map((action) => [action, allows(facet, action)])
+      ),
+    ])
+  ) as PermissionMatrix<TStatements>;
+}
+
+/** The full allow/deny table for `statements`, given the roles a subject holds. */
+export function buildPermissionMatrix<TStatements extends Statements>(
+  statements: TStatements,
+  roles: Record<string, NormalizedRole>,
+  effectiveRoleNames: readonly string[]
+): PermissionMatrix<TStatements> {
+  const granted = grantedActions(statements, roles, effectiveRoleNames);
+  return materialize(
+    statements,
+    (facet, action) => granted.get(facet)?.has(action) === true
   );
 }
 
@@ -237,40 +274,25 @@ export function constantMatrix<TStatements extends Statements>(
   return materialize(statements, () => value);
 }
 
-function materialize<TStatements extends Statements>(
-  statements: TStatements,
-  allows: (facet: string, action: string) => boolean
-): PermissionMatrix<TStatements> {
-  const matrix: PermissionTable = {};
-  for (const [facet, actions] of Object.entries(statements)) {
-    const row: Record<string, boolean> = {};
-    for (const action of actions) {
-      row[action] = allows(facet, action);
-    }
-    matrix[facet] = row;
-  }
-  return matrix as PermissionMatrix<TStatements>;
-}
-
 type ActionRequest =
   | readonly string[]
   | { actions: readonly string[]; connector?: 'AND' | 'OR' };
 
-function normalizeActionRequest(request: ActionRequest): {
-  actions: readonly string[];
-  connector: 'AND' | 'OR';
-} {
+function readActionRequest(
+  request: unknown
+): { actions: readonly string[]; connector: 'AND' | 'OR' } | null {
   if (Array.isArray(request)) {
-    return { actions: request, connector: 'AND' };
+    return { actions: request as readonly string[], connector: 'AND' };
   }
-  const object = request as {
-    actions?: readonly string[];
-    connector?: 'AND' | 'OR';
-  };
-  return {
-    actions: object.actions ?? [],
-    connector: object.connector === 'OR' ? 'OR' : 'AND',
-  };
+  if (typeof request !== 'object' || request === null) {
+    return null;
+  }
+  const { actions, connector } = request as Partial<
+    Exclude<ActionRequest, readonly string[]>
+  >;
+  return Array.isArray(actions)
+    ? { actions, connector: connector === 'OR' ? 'OR' : 'AND' }
+    : null;
 }
 
 /**
@@ -278,45 +300,35 @@ function normalizeActionRequest(request: ActionRequest): {
  *
  * Mirrors Better Auth's access-control semantics: actions within a facet and
  * facets within a request are `AND`ed unless a connector says otherwise. An
- * empty request is *not* satisfiable — asking for nothing must never be
- * mistaken for "allowed".
+ * empty request, or a facet with no actions, is never satisfied.
  */
 export function checkPermissions<TStatements extends Statements>(
   matrix: PermissionMatrix<TStatements>,
   request: PermissionRequest<TStatements>,
   connector: 'AND' | 'OR' = 'AND'
 ): boolean {
-  const entries = Object.entries(request as Record<string, ActionRequest>);
+  const table = matrix as PermissionTable;
+  const entries = Object.entries(request as Record<string, unknown>).filter(
+    ([, actions]) => actions !== undefined
+  );
   if (entries.length === 0) {
     return false;
   }
 
-  const table = matrix as PermissionTable;
-  let satisfiedAny = false;
+  const allows = (facet: string, action: string) => {
+    const row = own(table, facet);
+    return row !== undefined && own(row, action) === true;
+  };
 
-  for (const [facet, rawActions] of entries) {
-    if (rawActions === undefined) {
-      continue;
-    }
-    const { actions, connector: actionConnector } =
-      normalizeActionRequest(rawActions);
-    const row = table[facet];
-
-    const satisfied =
-      actions.length > 0 &&
-      (actionConnector === 'OR'
-        ? actions.some((action) => row?.[action] === true)
-        : actions.every((action) => row?.[action] === true));
-
-    if (satisfied) {
-      if (connector === 'OR') {
-        return true;
-      }
-      satisfiedAny = true;
-    } else if (connector === 'AND') {
+  const results = entries.map(([facet, raw]) => {
+    const parsed = readActionRequest(raw);
+    if (!parsed || parsed.actions.length === 0) {
       return false;
     }
-  }
+    return parsed.connector === 'OR'
+      ? parsed.actions.some((action) => allows(facet, action))
+      : parsed.actions.every((action) => allows(facet, action));
+  });
 
-  return satisfiedAny;
+  return connector === 'OR' ? results.some(Boolean) : results.every(Boolean);
 }

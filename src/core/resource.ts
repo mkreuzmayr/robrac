@@ -1,5 +1,5 @@
 import { RobracError } from './errors.ts';
-import { ALL_ACTIONS } from './roles.ts';
+import { ALL_ACTIONS, own } from './roles.ts';
 import type {
   PermissionRequest,
   ResourceRef,
@@ -69,13 +69,13 @@ export type ResourceDefinition<
   scope?: (data: TResource) => Scope;
 
   /**
-   * Roles derived from the resource itself rather than from a stored grant —
+   * Roles derived from the resource itself rather than from a stored grant:
    * "the creator is an owner", "org-visible recordings are readable by every
    * member".
    *
    * `roles` is a typed accumulator: only names declared in the `roles` map
    * above can be pushed, so a typo is a compile error rather than a role that
-   * silently confers nothing. Push into it, return an array, or both — the
+   * silently confers nothing. Push into it, return an array, or both; the
    * engine merges the two.
    *
    * @example
@@ -88,7 +88,7 @@ export type ResourceDefinition<
    *
    * Declared in method syntax on purpose: the accumulator's element type
    * narrows per resource, and methods are exempt from `strictFunctionTypes`'
-   * contravariant parameter check — which is what keeps a definition with a
+   * contravariant parameter check, which is what keeps a definition with a
    * narrowed accumulator assignable to the registry's erased
    * `ResourceDefinition` constraint. Safe here because only the engine ever
    * calls this, always with the definition's own role names.
@@ -103,14 +103,16 @@ export type ResourceDefinition<
   /**
    * Short-circuit the whole decision. `'allow'` grants every declared action,
    * `'deny'` revokes every one of them (legal hold, suspended tenant, ...).
-   * `deny` wins over `allow`.
+   *
+   * A `'deny'` also applies to every descendant reached through `parent`, and
+   * wins over a descendant's own `'allow'`. It blocks grant management too.
    */
   override?: (
     args: ResourceCallbackArgs<TResource>
   ) => Awaitable<'allow' | 'deny' | null | undefined>;
 
   /**
-   * The resource whose grants cascade onto this one — a folder, a project, a
+   * The resource whose grants cascade onto this one: a folder, a project, a
    * workspace. Roles held on the ancestor are translated by `inheritRole`.
    */
   parent?: (args: {
@@ -121,13 +123,24 @@ export type ResourceDefinition<
   }) => Awaitable<ResourceRef | null | undefined>;
 
   /**
+   * The resource types `parent()` can return. Optional, but without it
+   * anti-escalation must assume any type may be this resource's parent, which
+   * can refuse grants on unrelated types that share role names.
+   */
+  parentTypes?: readonly string[];
+
+  /**
    * Translate a role held on the ancestor into a role on this resource.
    * Return `null` to drop it. Defaults to identity when the ancestor's role
    * name also exists on this resource.
    *
-   * The incoming `role` is a plain string — it lives in the ancestor's
+   * The incoming `role` is a plain string: it lives in the ancestor's
    * namespace, which this definition knows nothing about. The return value is
    * constrained to this resource's own declared roles.
+   *
+   * Return `null` for parent types this resource never has. Anti-escalation
+   * calls this for descendants it cannot load, so the result should depend
+   * only on `parent.type` and `role`.
    */
   inheritRole?: (args: {
     parent: ResourceRef;
@@ -163,7 +176,7 @@ export type ResourceDefinition<
  *   load: ({ id }) => db.recording.findById(id),
  *   scope: (r) => r.organizationId,
  *   computeRoles: ({ data, subjects, roles }) => {
- *     // `roles` only accepts 'viewer' | 'owner' — a typo fails to compile.
+ *     // `roles` only accepts 'viewer' | 'owner'; a typo fails to compile.
  *     if (hasSubject(subjects, 'user', data.createdBy)) roles.push('owner');
  *   },
  *   manage: { recording: ['share'] },
@@ -201,31 +214,75 @@ export function subjectId(
 }
 
 /**
- * Reject typos at construction time. A role pointing at a facet or action that
- * was never declared is dead configuration, and dead configuration in an authz
- * system reads as "permission silently missing" months later.
+ * Reject typos at construction time. A role or `manage` request pointing at a
+ * facet or action that was never declared is dead configuration, which in an
+ * authz system reads as "permission silently missing" months later.
  */
 export function assertResourceIsConsistent(
   definition: ResourceDefinition<never, Statements, Record<string, RoleInput>>,
   roleStatements: Record<string, Record<string, readonly string[]>>
 ): void {
-  for (const [roleName, facets] of Object.entries(roleStatements)) {
-    for (const [facet, actions] of Object.entries(facets)) {
-      const declared = definition.statements[facet];
-      if (!declared) {
+  const assertDeclared = (
+    origin: string,
+    facet: string,
+    actions: readonly string[]
+  ) => {
+    const declared = own(definition.statements, facet);
+    if (!declared) {
+      throw new RobracError(
+        'INVALID_CONFIGURATION',
+        `Resource "${definition.type}" ${origin} references undeclared facet "${facet}".`
+      );
+    }
+    for (const action of actions) {
+      if (action !== ALL_ACTIONS && !declared.includes(action)) {
         throw new RobracError(
           'INVALID_CONFIGURATION',
-          `Resource "${definition.type}" role "${roleName}" references undeclared facet "${facet}".`
+          `Resource "${definition.type}" ${origin} references undeclared action "${facet}.${action}".`
         );
       }
-      for (const action of actions) {
-        if (action !== ALL_ACTIONS && !declared.includes(action)) {
-          throw new RobracError(
-            'INVALID_CONFIGURATION',
-            `Resource "${definition.type}" role "${roleName}" references undeclared action "${facet}.${action}".`
-          );
-        }
-      }
     }
+  };
+
+  for (const [roleName, facets] of Object.entries(roleStatements)) {
+    for (const [facet, actions] of Object.entries(facets)) {
+      assertDeclared(`role "${roleName}"`, facet, actions);
+    }
+  }
+
+  const manage: unknown = definition.manage;
+  if (typeof manage === 'function') {
+    return;
+  }
+  if (typeof manage !== 'object' || manage === null) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `Resource "${definition.type}" must declare manage as a permission request or a predicate.`
+    );
+  }
+  const requests = Object.entries(manage).filter(
+    ([, request]) => request !== undefined
+  );
+  if (requests.length === 0) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `Resource "${definition.type}" manage request must name at least one facet.`
+    );
+  }
+  for (const [facet, request] of requests) {
+    const actions: unknown = Array.isArray(request)
+      ? request
+      : (request as { actions?: unknown }).actions;
+    if (
+      !Array.isArray(actions) ||
+      actions.length === 0 ||
+      actions.includes(ALL_ACTIONS)
+    ) {
+      throw new RobracError(
+        'INVALID_CONFIGURATION',
+        `Resource "${definition.type}" manage request for "${facet}" must list at least one concrete action.`
+      );
+    }
+    assertDeclared('manage request', facet, actions as string[]);
   }
 }
