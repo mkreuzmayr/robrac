@@ -4,11 +4,11 @@
  * robrac deliberately keeps three things abstract so that it can be dropped
  * into any product without dragging that product's data model along:
  *
- * - **Subject** — *who* is asking. Not necessarily a user: an organization
+ * - **Subject**: *who* is asking. Not necessarily a user: an organization
  *   member, a team, a service account or an API key are all subjects.
- * - **Scope** — the tenant boundary a decision is made in (usually an
+ * - **Scope**: the tenant boundary a decision is made in (usually an
  *   organization id). `null` means "single tenant / not scoped".
- * - **Resource** — *what* is being accessed, identified by a `(type, id)` pair
+ * - **Resource**: *what* is being accessed, identified by a `(type, id)` pair
  *   that robrac never has to understand. The application teaches robrac how to
  *   load it via a {@link ResourceDefinition}.
  */
@@ -88,7 +88,7 @@ export type PermissionRequest<TStatements extends Statements = Statements> = {
  * Fully expanded allow/deny table for every declared facet + action.
  *
  * When the statements are a concrete `as const` object, this resolves to an
- * exact shape — `decision.permissions.recording.share` is a `boolean`, and a
+ * exact shape: `decision.permissions.recording.share` is a `boolean`, and a
  * typo in either segment is a compile error.
  */
 export type PermissionMatrix<TStatements extends Statements = Statements> = {
@@ -135,7 +135,7 @@ export type AppliedRole = {
 
 /**
  * The result of `evaluate`. This is the single object every other API is
- * derived from — `check` is just a predicate over `permissions`.
+ * derived from; `check` is just a predicate over `permissions`.
  */
 export type AccessDecision<
   TResource = unknown,

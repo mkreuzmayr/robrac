@@ -1,19 +1,21 @@
 import type { GrantStore } from '../store/types.ts';
-import { RobracError } from './errors.ts';
+import { RobracArgumentError, RobracError } from './errors.ts';
 import { assertResourceIsConsistent } from './resource.ts';
 import type { ResourceDefinition } from './resource.ts';
 import {
+  ALL_ACTIONS,
   buildPermissionMatrix,
   checkPermissions,
   constantMatrix,
+  grantedActions,
   normalizeRoles,
+  own,
 } from './roles.ts';
 import type {
   AccessDecision,
   AppliedRole,
   Grant,
   NormalizedRole,
-  PermissionMatrix,
   PermissionRequest,
   ResourceRef,
   RobracContext,
@@ -30,11 +32,9 @@ import type {
 /**
  * A heterogeneous map of resource definitions.
  *
- * `any` is load-bearing here rather than sloppy: each entry has a different
- * resource type, statement map and role map, and `unknown` would make the
- * definitions non-assignable and break inference in every callback. The
- * per-type helpers below (`DataOf`, `StatementsOf`, `RoleOf`) recover the
- * precise types wherever they matter, so nothing downstream sees `any`.
+ * `any` is load-bearing: each entry has a different resource, statement and
+ * role type, and `unknown` would make the definitions non-assignable. The
+ * helpers below recover the precise types wherever they matter.
  */
 export type ResourceRegistry = Record<
   string,
@@ -86,12 +86,7 @@ export type PermissionRequestOf<
   TType extends ResourceTypeOf<TRegistry>,
 > = PermissionRequest<StatementsOf<TRegistry, TType>>;
 
-/**
- * A decision for one registered resource type, with both the loaded data and
- * the permission matrix narrowed to what that type declares. This is what
- * makes `decision.permissions.recording.share` a checked `boolean` rather than
- * an index into a bag of strings.
- */
+/** A decision with the loaded data and permission matrix narrowed to one type. */
 export type DecisionFor<
   TRegistry extends ResourceRegistry,
   TType extends ResourceTypeOf<TRegistry>,
@@ -131,27 +126,24 @@ export type RobracEngineOptions<TRegistry extends ResourceRegistry> = {
    *
    * - `'required'` (default): every resource definition must implement
    *   `scope()`, and a resource whose scope differs from the requested one is
-   *   reported as not found. This is the setting that makes cross-tenant
-   *   access impossible by construction.
+   *   reported as not found.
    * - `'optional'`: scope is matched when the definition provides it.
    * - `'disabled'`: single-tenant; scope is always `null`.
    */
   scope?: 'required' | 'optional' | 'disabled';
 
   /**
-   * How far up a `parent()` chain grants cascade. Guards against cycles in
-   * application data.
+   * How many `parent()` levels grants and `'deny'` overrides cascade through.
+   * An integer from 0 to 64.
    *
    * @default 5
    */
   maxInheritanceDepth?: number;
 
   /**
-   * Whether a subject may hand out a role that exceeds its own permissions.
-   *
-   * `'deny'` (default) means an actor can only grant roles whose permissions
-   * are a subset of what the actor itself is allowed to do — a share-capable
-   * editor cannot mint owners.
+   * `'deny'` (default) means an actor can only grant, revoke or extend roles
+   * that stay within its own permissions, including what those roles cascade
+   * to on descendants and how long the actor's own access lasts.
    *
    * @default 'deny'
    */
@@ -160,7 +152,13 @@ export type RobracEngineOptions<TRegistry extends ResourceRegistry> = {
   /** Called for every evaluated decision. Use it to feed an audit log. */
   onDecision?: (event: DecisionEvent) => void;
 
-  /** Called whenever grants change. Use it to feed an audit log. */
+  /**
+   * Called whenever grants change, and awaited when it returns a promise.
+   * Runs inside the store transaction when the store has one, so a throwing
+   * hook rolls the change back. Keep it fast, and don't write through a
+   * second connection that waits on that transaction: on a single-connection
+   * database such as SQLite that deadlocks.
+   */
   onGrantChange?: (event: GrantChangeEvent) => void;
 
   /** Clock injection point, for tests and for deterministic replay. */
@@ -176,57 +174,108 @@ export type CompiledResource = {
   roles: Record<string, NormalizedRole>;
 };
 
-/**
- * Compiled registries, keyed by the registry object and scope mode.
- *
- * The Better Auth plugin compiles eagerly so that a bad role map fails at boot,
- * then `createRobrac` compiles again when the adapter shows up. Both want the
- * same answer for the same registry, so the second call is a cache hit rather
- * than a second pass over every role.
- */
+const MAX_INHERITANCE_DEPTH = 64;
+
+/** Validate `maxInheritanceDepth`, which bounds the loads per evaluation. */
+export function inheritanceDepth(value: number | undefined): number {
+  const depth = value ?? 5;
+  if (
+    !Number.isSafeInteger(depth) ||
+    depth < 0 ||
+    depth > MAX_INHERITANCE_DEPTH
+  ) {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `maxInheritanceDepth must be an integer from 0 to ${MAX_INHERITANCE_DEPTH}.`
+    );
+  }
+  return depth;
+}
+
+function assertDefinitionShape(key: string, definition: unknown): void {
+  const fail = (reason: string) => {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      `Resource "${key}" ${reason}.`
+    );
+  };
+  if (typeof definition !== 'object' || definition === null) {
+    fail('must be a resource definition');
+  }
+  const { type, statements, roles, load } = definition as Record<
+    string,
+    unknown
+  >;
+  if (type !== key) {
+    fail(`declares type "${String(type)}"; it must match its registry key`);
+  }
+  if (typeof load !== 'function') {
+    fail('must implement load()');
+  }
+  if (typeof roles !== 'object' || roles === null) {
+    fail('must declare roles');
+  }
+  if (typeof statements !== 'object' || statements === null) {
+    fail('must declare statements');
+  }
+  for (const [facet, actions] of Object.entries(statements as object)) {
+    if (
+      !Array.isArray(actions) ||
+      actions.some(
+        (action) => typeof action !== 'string' || action === ALL_ACTIONS
+      )
+    ) {
+      fail(`declares facet "${facet}" with invalid actions`);
+    }
+  }
+}
+
 const compilationCache = new WeakMap<
   ResourceRegistry,
   Map<string, Map<string, CompiledResource>>
 >();
 
 /**
- * Validate a registry and pre-resolve its role inheritance.
- *
- * Called eagerly by both `createRobrac` and the Better Auth plugin so that a
- * typo in a role name fails at boot rather than at the first authorization
- * check in production.
+ * Validate a registry and pre-resolve its role inheritance, so a typo in a
+ * role name fails at boot rather than at the first authorization check.
  */
 export function compileResources(
   resources: ResourceRegistry,
   scopeMode: 'required' | 'optional' | 'disabled'
 ): Map<string, CompiledResource> {
-  const byScopeMode = compilationCache.get(resources);
-  const cached = byScopeMode?.get(scopeMode);
+  const byScopeMode =
+    compilationCache.get(resources) ??
+    new Map<string, Map<string, CompiledResource>>();
+  const cached = byScopeMode.get(scopeMode);
   if (cached) {
     return cached;
   }
 
   const compiled = new Map<string, CompiledResource>();
-
-  const entries = Object.entries(resources) as [
-    string,
-    CompiledResource['definition'],
-  ][];
-
-  for (const [key, definition] of entries) {
-    if (definition.type !== key) {
-      throw new RobracError(
-        'INVALID_CONFIGURATION',
-        `Resource registered under key "${key}" declares type "${definition.type}". They must match.`
-      );
-    }
-    if (scopeMode === 'required' && !definition.scope) {
+  for (const [key, value] of Object.entries(resources)) {
+    assertDefinitionShape(key, value);
+    const definition = value as CompiledResource['definition'];
+    if (scopeMode === 'required' && typeof definition.scope !== 'function') {
       throw new RobracError(
         'INVALID_CONFIGURATION',
         `Resource "${key}" must implement scope() when robrac runs with scope: 'required'.`
       );
     }
-
+    const parentTypes: unknown = definition.parentTypes;
+    if (parentTypes !== undefined && !Array.isArray(parentTypes)) {
+      throw new RobracError(
+        'INVALID_CONFIGURATION',
+        `Resource "${key}" must list parentTypes as an array.`
+      );
+    }
+    for (const parentType of definition.parentTypes ?? []) {
+      if (!Object.hasOwn(resources, parentType)) {
+        throw new RobracError(
+          'INVALID_CONFIGURATION',
+          `Resource "${key}" lists unknown parent type "${parentType}".`
+        );
+      }
+    }
     const roles = normalizeRoles(definition.roles);
     assertResourceIsConsistent(
       definition as never,
@@ -234,18 +283,11 @@ export function compileResources(
         Object.entries(roles).map(([name, role]) => [name, role.effective])
       )
     );
-    compiled.set(key, {
-      definition,
-      roles,
-    });
+    compiled.set(key, { definition, roles });
   }
 
-  if (byScopeMode) {
-    byScopeMode.set(scopeMode, compiled);
-  } else {
-    compilationCache.set(resources, new Map([[scopeMode, compiled]]));
-  }
-
+  byScopeMode.set(scopeMode, compiled);
+  compilationCache.set(resources, byScopeMode);
   return compiled;
 }
 
@@ -253,31 +295,150 @@ export function compileResources(
 /* Engine                                                                     */
 /* -------------------------------------------------------------------------- */
 
-type CollectedRoles = {
+type Held = Map<string, Hold[]>;
+
+/**
+ * One source of a role: when it expires (epoch ms, `Infinity` = never) and how
+ * many levels below this resource it still cascades.
+ */
+type Hold = { expiry: number; reach: number };
+
+type Override = 'allow' | 'deny' | null;
+
+type Node = {
+  entry: CompiledResource;
+  ref: ResourceRef;
   data: unknown;
-  resource: ResourceRef;
+  override: Override;
   applied: AppliedRole[];
+  held: Held;
+  parent: ResourceRef | null;
 };
+
+type Resolved = {
+  node: Node;
+  applied: AppliedRole[];
+  held: Held;
+  override: Override;
+};
+
+type Evaluation = {
+  decision: AccessDecision;
+  held: Held;
+};
+
+function refKey(ref: ResourceRef): string {
+  return JSON.stringify([ref.type, ref.id]);
+}
+
+function readOverride(value: unknown): Override {
+  return value === 'allow' || value === 'deny' ? value : null;
+}
+
+function readParent(value: unknown): ResourceRef | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const { type, id } = value as Partial<ResourceRef>;
+  if (typeof type !== 'string' || typeof id !== 'string') {
+    throw new RobracError(
+      'INVALID_CONFIGURATION',
+      'parent() must return { type, id } or null.'
+    );
+  }
+  return { type, id };
+}
+
+// An invalid date fails closed: `NaN > now` is false.
+function isLive(grant: Grant, at: Date): boolean {
+  return grant.expiresAt === null || grant.expiresAt.getTime() > at.getTime();
+}
+
+function isSubject(grant: Grant, subject: SubjectRef): boolean {
+  return grant.subjectType === subject.type && grant.subjectId === subject.id;
+}
+
+function hold(held: Held, role: string, source: Hold): void {
+  const holds = held.get(role) ?? [];
+  holds.push(source);
+  held.set(role, holds);
+}
+
+/** Role -> furthest reach among its holds that are still live after `time`. */
+function reachAfter(held: Held, time = -Infinity): Map<string, number> {
+  const reaches = new Map<string, number>();
+  for (const [role, holds] of held) {
+    for (const { expiry, reach } of holds) {
+      if (expiry > time) {
+        reaches.set(role, Math.max(reaches.get(role) ?? -1, reach));
+      }
+    }
+  }
+  return reaches;
+}
+
+function unique<T>(values: Iterable<T>): T[] {
+  return [...new Set(values)];
+}
 
 export type RobracEngine<TRegistry extends ResourceRegistry> = ReturnType<
   typeof createRobrac<TRegistry>
 >;
 
+type BeforeWrite = () => Promise<void>;
+
+type AuthorizedWrite = {
+  type: string;
+  id: string;
+  subject: SubjectRef;
+  actor: readonly SubjectRef[];
+  grantedBy?: SubjectRef;
+  scope?: Scope;
+  expiresAt?: Date | null;
+  context?: RobracContext;
+};
+
+type CheckedWrites = {
+  grant(
+    args: AuthorizedWrite & { role: string },
+    beforeWrite: BeforeWrite
+  ): Promise<Grant>;
+  setRoles(
+    args: AuthorizedWrite & { roles: readonly string[] },
+    beforeWrite: BeforeWrite
+  ): Promise<Grant[]>;
+};
+
+const checkedWrites = new WeakMap<object, CheckedWrites>();
+
+/**
+ * `authorized.grant` and `setRoles` running `beforeWrite` once the caller is
+ * authorized and before anything is written. For the plugin, which validates
+ * the subject only for callers allowed to manage the resource.
+ */
+export function withBeforeWrite(engine: object): CheckedWrites {
+  const writes = checkedWrites.get(engine);
+  if (!writes) {
+    throw new TypeError('Not a robrac engine.');
+  }
+  return writes;
+}
+
 /**
  * Build a framework-agnostic authorization engine.
  *
- * This is the whole of robrac's logic. The Better Auth plugin in
- * `plugin/plugin.ts` is a thin transport layer on top of it — background
- * workers, cron jobs, gRPC services or a second HTTP framework can import this
- * directly and get byte-identical decisions.
+ * The Better Auth plugin is a thin transport on top of this. Background
+ * workers, cron jobs or another HTTP framework can import it directly and get
+ * identical decisions.
  */
 export function createRobrac<const TRegistry extends ResourceRegistry>(
   options: RobracEngineOptions<TRegistry>
 ) {
   const scopeMode = options.scope ?? 'required';
-  const maxDepth = options.maxInheritanceDepth ?? 5;
+  const maxDepth = inheritanceDepth(options.maxInheritanceDepth);
   const escalation = options.escalation ?? 'deny';
   const now = options.now ?? (() => new Date());
+  const store = options.store;
 
   const compiled = compileResources(options.resources, scopeMode);
 
@@ -292,15 +453,9 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     return entry;
   }
 
-  /**
-   * Normalize the scope a caller supplied.
-   *
-   * Under `'disabled'` every grant lives in the null scope, so whatever the
-   * caller passes is collapsed. Under `'required'` a missing scope is a caller
-   * bug, not "no access": silently treating it as `null` makes every resource
-   * report `found: false` with no diagnostic, which is indistinguishable from a
-   * permission problem and takes hours to track down.
-   */
+  // A missing scope under 'required' is a caller bug. Collapsing it to `null`
+  // would make every resource read as not found, which looks like a
+  // permission problem and hides the real cause.
   function resolveScope(scope: Scope | undefined): Scope {
     if (scopeMode === 'disabled') {
       return null;
@@ -310,20 +465,14 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       throw new RobracError(
         'SCOPE_REQUIRED',
         "No scope was provided, but robrac is configured with scope: 'required'. " +
-          'Check that a tenant is selected — with the Better Auth plugin this usually means the session has no activeOrganizationId.'
+          'With the Better Auth plugin this usually means the session has no activeOrganizationId.'
       );
     }
     return value;
   }
 
-  /**
-   * Scope for bulk deletions, which must never widen.
-   *
-   * Unlike {@link resolveScope} this never collapses a caller-supplied value to
-   * `null`: under `'disabled'` that would silently turn "delete this tenant's
-   * grants" into "delete every grant in the database", since all rows are
-   * stored with a null scope.
-   */
+  // Bulk deletions never collapse a given scope to `null`: under 'disabled'
+  // that would turn "delete this tenant's grants" into "delete every grant".
   function bulkScope(scope: Scope | undefined): Scope {
     const value = scope ?? null;
     if (scopeMode === 'required' && value === null) {
@@ -335,27 +484,50 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     return value;
   }
 
-  async function loadResources(
+  function roleOf(entry: CompiledResource, role: string) {
+    return own(entry.roles, role);
+  }
+
+  function inScope(entry: CompiledResource, data: unknown, scope: Scope) {
+    if (scopeMode === 'disabled' || !entry.definition.scope) {
+      return true;
+    }
+    return entry.definition.scope(data) === scope;
+  }
+
+  function mapInherited(
+    entry: CompiledResource,
+    parent: ResourceRef,
+    role: string
+  ): string | null {
+    const mapped = entry.definition.inheritRole
+      ? entry.definition.inheritRole({ parent, role })
+      : role;
+    return typeof mapped === 'string' && roleOf(entry, mapped) ? mapped : null;
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Evaluation                                                              */
+  /* ---------------------------------------------------------------------- */
+
+  async function loadData(
     entry: CompiledResource,
     ids: readonly string[],
     scope: Scope,
     context: RobracContext
   ): Promise<Map<string, unknown>> {
-    const unique = [...new Set(ids)];
-    if (unique.length === 0) {
-      return new Map();
+    const { definition } = entry;
+    const present = new Map<string, unknown>();
+    if (ids.length === 0) {
+      return present;
     }
 
-    const { definition } = entry;
-
-    // `!= null` on purpose: `TResource` is inferred from the loader, so a
-    // perfectly idiomatic `({ id }) => map.get(id)` returns `undefined` for a
-    // miss. Treating that as "found" hands `undefined` to `scope()` and
-    // crashes the request instead of answering `found: false`.
+    // `!= null` on purpose: a loader like `({ id }) => map.get(id)` returns
+    // `undefined` for a miss, which must read as "not found".
     if (definition.loadMany) {
-      const loaded = await definition.loadMany({ ids: unique, scope, context });
-      const present = new Map<string, unknown>();
-      for (const [id, data] of loaded) {
+      const loaded = await definition.loadMany({ ids, scope, context });
+      for (const id of ids) {
+        const data = loaded.get(id);
         if (data != null) {
           present.set(id, data);
         }
@@ -363,215 +535,263 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       return present;
     }
 
-    const loaded = await Promise.all(
-      unique.map(
-        async (id) =>
-          [id, await definition.load({ id, scope, context })] as const
-      )
+    await Promise.all(
+      ids.map(async (id) => {
+        const data = await definition.load({ id, scope, context });
+        if (data != null) {
+          present.set(id, data);
+        }
+      })
     );
-    return new Map(
-      loaded.filter((pair): pair is [string, unknown] => pair[1] != null)
-    );
+    return present;
   }
 
-  function inScope(
-    entry: CompiledResource,
-    data: unknown,
-    scope: Scope
-  ): boolean {
-    if (scopeMode === 'disabled' || !entry.definition.scope) {
-      return true;
+  async function buildNodes(args: {
+    entry: CompiledResource;
+    ids: readonly string[];
+    subjects: readonly SubjectRef[];
+    scope: Scope;
+    context: RobracContext;
+    at: Date;
+    expand: boolean;
+  }): Promise<Map<string, Node>> {
+    const { entry, scope, context, subjects } = args;
+    const type = entry.definition.type;
+    const loaded = await loadData(entry, args.ids, scope, context);
+    const present = [...loaded].filter(([, data]) =>
+      inScope(entry, data, scope)
+    );
+
+    const grants =
+      present.length === 0 || subjects.length === 0
+        ? []
+        : await store.findGrants({
+            scope,
+            resourceType: type,
+            resourceIds: present.map(([id]) => id),
+            subjects,
+            now: args.at,
+          });
+
+    const grantsByResource = new Map<string, Grant[]>();
+    for (const grant of grants) {
+      // Re-checked here so a lax custom store cannot widen access.
+      if (
+        grant.scope !== scope ||
+        grant.resourceType !== type ||
+        !subjects.some((subject) => isSubject(grant, subject)) ||
+        !isLive(grant, args.at)
+      ) {
+        continue;
+      }
+      const bucket = grantsByResource.get(grant.resourceId) ?? [];
+      bucket.push(grant);
+      grantsByResource.set(grant.resourceId, bucket);
     }
-    return entry.definition.scope(data) === scope;
+
+    const nodes = await Promise.all(
+      present.map(async ([id, data]): Promise<Node> => {
+        const ref: ResourceRef = { type, id };
+        const callbackArgs = { data, resource: ref, scope, subjects, context };
+        const override = readOverride(
+          await entry.definition.override?.(callbackArgs)
+        );
+
+        const applied: AppliedRole[] = [];
+        const held: Held = new Map();
+        const explicit = new Set<string>();
+        for (const grant of grantsByResource.get(id) ?? []) {
+          if (!explicit.has(grant.role)) {
+            explicit.add(grant.role);
+            applied.push({ role: grant.role, origin: 'explicit' });
+          }
+          // A row naming an undeclared role is listed but confers nothing,
+          // here or on descendants.
+          if (roleOf(entry, grant.role)) {
+            hold(held, grant.role, {
+              expiry: grant.expiresAt?.getTime() ?? Infinity,
+              reach: maxDepth,
+            });
+          }
+        }
+
+        const accumulated: string[] = [];
+        const returned = await entry.definition.computeRoles?.({
+          ...callbackArgs,
+          roles: accumulated,
+        });
+        const computed = [
+          ...accumulated,
+          ...(Array.isArray(returned) ? (returned as unknown[]) : []),
+        ];
+        for (const role of unique(computed)) {
+          if (typeof role === 'string' && roleOf(entry, role)) {
+            applied.push({ role, origin: 'computed' });
+            hold(held, role, { expiry: Infinity, reach: maxDepth });
+          }
+        }
+
+        const parent =
+          args.expand && override !== 'deny' && entry.definition.parent
+            ? readParent(
+                await entry.definition.parent({
+                  data,
+                  resource: ref,
+                  scope,
+                  context,
+                })
+              )
+            : null;
+        const { parentTypes } = entry.definition;
+        if (parent && parentTypes && !parentTypes.includes(parent.type)) {
+          throw new RobracError(
+            'INVALID_CONFIGURATION',
+            `parent() of "${type}" returned type "${parent.type}", which parentTypes does not list.`
+          );
+        }
+
+        return { entry, ref, data, override, applied, held, parent };
+      })
+    );
+
+    return new Map(nodes.map((node) => [node.ref.id, node]));
   }
 
   /**
-   * Gather every role a set of subjects effectively holds on a batch of
-   * resources of one type, expressed in that type's own role namespace.
-   *
-   * Runs one grant query and one resource load per level of the parent chain,
-   * regardless of how many resources are being evaluated.
+   * Load the requested resources and every ancestor within `maxDepth`, one
+   * load and one grant query per resource type and level, then fold roles and
+   * `'deny'` overrides down each parent chain.
    */
-  async function collectRoles(args: {
+  async function collect(args: {
     type: string;
     ids: readonly string[];
     subjects: readonly SubjectRef[];
     scope: Scope;
     context: RobracContext;
-    depth: number;
-  }): Promise<Map<string, CollectedRoles>> {
-    const entry = resource(args.type);
-    const loaded = await loadResources(
-      entry,
-      args.ids,
-      args.scope,
-      args.context
-    );
+    at: Date;
+  }): Promise<Map<string, Resolved>> {
+    const graph = new Map<string, Map<string, Node | null>>();
+    const known = (ref: ResourceRef) =>
+      graph.get(ref.type)?.has(ref.id) === true;
 
-    const present = new Map<string, unknown>();
-    for (const [id, data] of loaded) {
-      if (inScope(entry, data, args.scope)) {
-        present.set(id, data);
-      }
-    }
-    if (present.size === 0) {
-      return new Map();
-    }
-
-    const grants =
-      args.subjects.length === 0
-        ? []
-        : await options.store.findGrants({
-            scope: args.scope,
-            resourceType: args.type,
-            resourceIds: [...present.keys()],
-            subjects: args.subjects,
-            now: now(),
+    let frontier = new Map([[args.type, unique(args.ids)]]);
+    for (let depth = 0; frontier.size > 0; depth++) {
+      const levelNodes: Node[] = [];
+      await Promise.all(
+        [...frontier].map(async ([type, ids]) => {
+          const entry = compiled.get(type);
+          if (!entry) {
+            throw new RobracError(
+              'INVALID_CONFIGURATION',
+              `parent() returned unknown resource type "${type}".`
+            );
+          }
+          const nodes = await buildNodes({
+            ...args,
+            entry,
+            ids,
+            expand: depth < maxDepth,
           });
+          const byId = graph.get(type) ?? new Map<string, Node | null>();
+          graph.set(type, byId);
+          for (const id of ids) {
+            const node = nodes.get(id) ?? null;
+            byId.set(id, node);
+            if (node) {
+              levelNodes.push(node);
+            }
+          }
+        })
+      );
 
-    const grantsByResource = new Map<string, Grant[]>();
-    for (const grant of grants) {
-      const bucket = grantsByResource.get(grant.resourceId);
-      if (bucket) {
-        bucket.push(grant);
-      } else {
-        grantsByResource.set(grant.resourceId, [grant]);
+      const next = new Map<string, string[]>();
+      for (const node of levelNodes) {
+        if (node.parent && !known(node.parent)) {
+          const ids = next.get(node.parent.type) ?? [];
+          if (!ids.includes(node.parent.id)) {
+            ids.push(node.parent.id);
+          }
+          next.set(node.parent.type, ids);
+        }
+      }
+      frontier = next;
+    }
+
+    const resolve = (
+      ref: ResourceRef,
+      remaining: number,
+      chain: Set<string>
+    ): Resolved | null => {
+      const node = graph.get(ref.type)?.get(ref.id);
+      if (!node) {
+        return null;
+      }
+      const applied = [...node.applied];
+      const held: Held = new Map(
+        [...node.held].map(([role, holds]) => [role, [...holds]])
+      );
+      let override = node.override;
+
+      const parentRef = node.parent;
+      if (
+        override !== 'deny' &&
+        parentRef &&
+        remaining > 0 &&
+        !chain.has(refKey(parentRef))
+      ) {
+        const parent = resolve(
+          parentRef,
+          remaining - 1,
+          new Set(chain).add(refKey(parentRef))
+        );
+        if (parent?.override === 'deny') {
+          override = 'deny';
+        } else if (parent) {
+          const inherited = new Set<string>();
+          for (const [role, holds] of parent.held) {
+            const mapped = mapInherited(node.entry, parentRef, role);
+            if (!mapped) {
+              continue;
+            }
+            if (!inherited.has(mapped)) {
+              inherited.add(mapped);
+              applied.push({
+                role: mapped,
+                origin: 'inherited',
+                via: parentRef,
+              });
+            }
+            for (const { expiry, reach } of holds) {
+              if (reach > 0) {
+                hold(held, mapped, { expiry, reach: reach - 1 });
+              }
+            }
+          }
+        }
+      }
+
+      return { node, applied, held, override };
+    };
+
+    const result = new Map<string, Resolved>();
+    for (const id of unique(args.ids)) {
+      const ref = { type: args.type, id };
+      const resolved = resolve(ref, maxDepth, new Set([refKey(ref)]));
+      if (resolved) {
+        result.set(id, resolved);
       }
     }
-
-    const result = new Map<string, CollectedRoles>();
-
-    await Promise.all(
-      [...present].map(async ([id, data]) => {
-        const ref: ResourceRef = { type: args.type, id };
-        const applied: AppliedRole[] = (grantsByResource.get(id) ?? []).map(
-          (grant) => ({ role: grant.role, origin: 'explicit' as const })
-        );
-
-        // `computeRoles` can push into the typed accumulator, return an
-        // array, or do both; the union of the two is what counts.
-        const accumulated: string[] = [];
-        const returned = await entry.definition.computeRoles?.({
-          data,
-          resource: ref,
-          scope: args.scope,
-          subjects: args.subjects,
-          context: args.context,
-          roles: accumulated,
-        });
-        for (const role of new Set([...accumulated, ...(returned ?? [])])) {
-          applied.push({ role, origin: 'computed' });
-        }
-
-        result.set(id, { data, resource: ref, applied });
-      })
-    );
-
-    if (entry.definition.parent && args.depth < maxDepth) {
-      await applyInheritance({ entry, result, ...args });
-    }
-
     return result;
   }
 
-  /** Resolve one level of parents for a batch and fold their roles down. */
-  async function applyInheritance(args: {
-    entry: CompiledResource;
-    result: Map<string, CollectedRoles>;
-    subjects: readonly SubjectRef[];
-    scope: Scope;
-    context: RobracContext;
-    depth: number;
-  }): Promise<void> {
-    const { entry, result } = args;
-    const parentOf = new Map<string, ResourceRef>();
-
-    await Promise.all(
-      [...result].map(async ([id, collected]) => {
-        const parent = await entry.definition.parent?.({
-          data: collected.data,
-          resource: collected.resource,
-          scope: args.scope,
-          context: args.context,
-        });
-        if (parent) {
-          parentOf.set(id, parent);
-        }
-      })
-    );
-
-    if (parentOf.size === 0) {
-      return;
-    }
-
-    const idsByType = new Map<string, Set<string>>();
-    for (const parent of parentOf.values()) {
-      const bucket = idsByType.get(parent.type);
-      if (bucket) {
-        bucket.add(parent.id);
-      } else {
-        idsByType.set(parent.type, new Set([parent.id]));
-      }
-    }
-
-    const parentRoles = new Map<string, Map<string, CollectedRoles>>();
-    await Promise.all(
-      [...idsByType].map(async ([parentType, ids]) => {
-        parentRoles.set(
-          parentType,
-          await collectRoles({
-            type: parentType,
-            ids: [...ids],
-            subjects: args.subjects,
-            scope: args.scope,
-            context: args.context,
-            depth: args.depth + 1,
-          })
-        );
-      })
-    );
-
-    for (const [id, parent] of parentOf) {
-      const collected = result.get(id);
-      const inherited = parentRoles.get(parent.type)?.get(parent.id);
-      if (!collected || !inherited) {
-        continue;
-      }
-
-      const seen = new Set<string>();
-      for (const applied of inherited.applied) {
-        if (seen.has(applied.role)) {
-          continue;
-        }
-        seen.add(applied.role);
-
-        const mapped = entry.definition.inheritRole
-          ? entry.definition.inheritRole({ parent, role: applied.role })
-          : // Default: carry the role over when the child declares a role of
-            // the same name. Anything else is dropped rather than guessed.
-            entry.roles[applied.role]
-            ? applied.role
-            : null;
-
-        if (mapped) {
-          collected.applied.push({
-            role: mapped,
-            origin: 'inherited',
-            via: parent,
-          });
-        }
-      }
-    }
-  }
-
-  function decide(
+  function toDecision(
     entry: CompiledResource,
     scope: Scope,
     ref: ResourceRef,
-    collected: CollectedRoles | undefined,
-    override: 'allow' | 'deny' | null
+    resolved: Resolved | undefined
   ): AccessDecision {
-    if (!collected) {
+    const statements = entry.definition.statements;
+    if (!resolved) {
       return {
         found: false,
         scope,
@@ -579,166 +799,106 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
         data: null,
         roles: [],
         effectiveRoles: [],
-        permissions: constantMatrix(entry.definition.statements, false),
+        permissions: constantMatrix(statements, false),
         override: null,
       };
     }
-
-    const effectiveRoles = [
-      ...new Set(collected.applied.map((applied) => applied.role)),
-    ];
-
-    let permissions: PermissionMatrix;
-    if (override === 'deny') {
-      permissions = constantMatrix(entry.definition.statements, false);
-    } else if (override === 'allow') {
-      permissions = constantMatrix(entry.definition.statements, true);
-    } else {
-      permissions = buildPermissionMatrix(
-        entry.definition.statements,
-        entry.roles,
-        effectiveRoles
-      );
-    }
-
+    const { override } = resolved;
     return {
       found: true,
       scope,
       resource: ref,
-      data: collected.data,
-      roles: collected.applied,
-      effectiveRoles,
-      permissions,
+      data: resolved.node.data,
+      roles: resolved.applied,
+      effectiveRoles: unique(resolved.applied.map((applied) => applied.role)),
+      permissions:
+        override === null
+          ? buildPermissionMatrix(statements, entry.roles, [
+              ...resolved.held.keys(),
+            ])
+          : constantMatrix(statements, override === 'allow'),
       override,
     };
   }
 
-  /**
-   * The single evaluation path.
-   *
-   * `emit` exists so that `check`, `require` and `filterAccessible` can report
-   * one audit event carrying the actual verdict, instead of a bare decision
-   * event from here followed by a second one with `allowed` filled in. An audit
-   * consumer should see exactly one event per authorization question.
-   */
-  async function evaluateManyInternal<
-    TType extends ResourceTypeOf<TRegistry>,
-  >(args: {
-    type: TType;
+  async function evaluateBatch(args: {
+    type: string;
     ids: readonly string[];
     subjects: readonly SubjectRef[];
     scope?: Scope;
     context?: RobracContext;
     emit: boolean;
-  }): Promise<Map<string, DecisionFor<TRegistry, TType>>> {
+  }): Promise<Map<string, Evaluation>> {
     const entry = resource(args.type);
     const scope = resolveScope(args.scope);
-    const context = args.context ?? {};
-
-    const collected = await collectRoles({
+    const resolved = await collect({
       type: args.type,
       ids: args.ids,
       subjects: args.subjects,
       scope,
-      context,
-      depth: 0,
+      context: args.context ?? {},
+      at: now(),
     });
 
-    const decisions = new Map<string, DecisionFor<TRegistry, TType>>();
-
-    await Promise.all(
-      [...new Set(args.ids)].map(async (id) => {
-        const ref: ResourceRef = { type: args.type, id };
-        const found = collected.get(id);
-
-        const override = found
-          ? ((await entry.definition.override?.({
-              data: found.data,
-              resource: ref,
-              scope,
-              subjects: args.subjects,
-              context,
-            })) ?? null)
-          : null;
-
-        const decision = decide(
-          entry,
+    const evaluations = new Map<string, Evaluation>();
+    for (const id of unique(args.ids)) {
+      const ref: ResourceRef = { type: args.type, id };
+      const found = resolved.get(id);
+      const decision = toDecision(entry, scope, ref, found);
+      evaluations.set(id, { decision, held: found?.held ?? new Map() });
+      if (args.emit) {
+        options.onDecision?.({
+          subjects: args.subjects,
           scope,
-          ref,
-          found,
-          override
-        ) as DecisionFor<TRegistry, TType>;
-        decisions.set(id, decision);
-        if (args.emit) {
-          options.onDecision?.({
-            subjects: args.subjects,
-            scope,
-            resource: ref,
-            decision,
-          });
-        }
-      })
-    );
-
-    return decisions;
+          resource: ref,
+          decision,
+        });
+      }
+    }
+    return evaluations;
   }
 
-  function evaluateMany<TType extends ResourceTypeOf<TRegistry>>(args: {
+  async function evaluateOne(args: {
+    type: string;
+    id: string;
+    subjects: readonly SubjectRef[];
+    scope?: Scope;
+    context?: RobracContext;
+    emit: boolean;
+  }): Promise<Evaluation> {
+    const evaluations = await evaluateBatch({ ...args, ids: [args.id] });
+    return evaluations.get(args.id)!;
+  }
+
+  async function evaluateMany<TType extends ResourceTypeOf<TRegistry>>(args: {
     type: TType;
     ids: readonly string[];
     subjects: readonly SubjectRef[];
     scope?: Scope;
     context?: RobracContext;
   }): Promise<Map<string, DecisionFor<TRegistry, TType>>> {
-    return evaluateManyInternal({ ...args, emit: true });
+    const evaluations = await evaluateBatch({ ...args, emit: true });
+    return new Map(
+      [...evaluations].map(([id, { decision }]) => [
+        id,
+        decision as DecisionFor<TRegistry, TType>,
+      ])
+    );
   }
 
-  async function evaluateInternal<
-    TType extends ResourceTypeOf<TRegistry>,
-  >(args: {
-    type: TType;
-    id: string;
-    subjects: readonly SubjectRef[];
-    scope?: Scope;
-    context?: RobracContext;
-    emit: boolean;
-  }): Promise<DecisionFor<TRegistry, TType>> {
-    const decisions = await evaluateManyInternal({
-      type: args.type,
-      ids: [args.id],
-      subjects: args.subjects,
-      scope: args.scope,
-      context: args.context,
-      emit: args.emit,
-    });
-
-    const decision = decisions.get(args.id);
-    if (decision) {
-      return decision;
-    }
-
-    // `evaluateManyInternal` always materializes a decision per requested id;
-    // this is unreachable defensive code that keeps the return non-nullable.
-    return decide(
-      resource(args.type),
-      resolveScope(args.scope),
-      { type: args.type, id: args.id },
-      undefined,
-      null
-    ) as DecisionFor<TRegistry, TType>;
-  }
-
-  function evaluate<TType extends ResourceTypeOf<TRegistry>>(args: {
+  async function evaluate<TType extends ResourceTypeOf<TRegistry>>(args: {
     type: TType;
     id: string;
     subjects: readonly SubjectRef[];
     scope?: Scope;
     context?: RobracContext;
   }): Promise<DecisionFor<TRegistry, TType>> {
-    return evaluateInternal({ ...args, emit: true });
+    const { decision } = await evaluateOne({ ...args, emit: true });
+    return decision as DecisionFor<TRegistry, TType>;
   }
 
-  /** Report one audit event carrying the verdict for a permission request. */
+  // `check`, `require`, `filterAccessible` and grant management report one
+  // event carrying the verdict instead of a bare decision event plus another.
   function emitVerdict(
     subjects: readonly SubjectRef[],
     decision: AccessDecision,
@@ -755,6 +915,17 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     });
   }
 
+  function allows(
+    decision: AccessDecision,
+    request: PermissionRequest,
+    connector: 'AND' | 'OR' | undefined
+  ): boolean {
+    return (
+      decision.found &&
+      checkPermissions(decision.permissions, request, connector)
+    );
+  }
+
   async function check<TType extends ResourceTypeOf<TRegistry>>(args: {
     type: TType;
     id: string;
@@ -765,11 +936,8 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     /** How several facets in one request combine. Defaults to `AND`. */
     connector?: 'AND' | 'OR';
   }): Promise<boolean> {
-    const decision = await evaluateInternal({ ...args, emit: false });
-    const allowed =
-      decision.found &&
-      checkPermissions(decision.permissions, args.permissions, args.connector);
-
+    const { decision } = await evaluateOne({ ...args, emit: false });
+    const allowed = allows(decision, args.permissions, args.connector);
     emitVerdict(args.subjects, decision, args.permissions, allowed);
     return allowed;
   }
@@ -784,29 +952,19 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     context?: RobracContext;
     connector?: 'AND' | 'OR';
   }): Promise<DecisionFor<TRegistry, TType>> {
-    const decision = await evaluateInternal({ ...args, emit: false });
-    const allowed =
-      decision.found &&
-      checkPermissions(decision.permissions, args.permissions, args.connector);
-
+    const { decision } = await evaluateOne({ ...args, emit: false });
+    const allowed = allows(decision, args.permissions, args.connector);
     emitVerdict(args.subjects, decision, args.permissions, allowed);
-
     if (!allowed) {
       throw new RobracError(
         'FORBIDDEN',
         `Not allowed to perform this action on ${args.type}:${args.id}.`
       );
     }
-    return decision;
+    return decision as DecisionFor<TRegistry, TType>;
   }
 
-  /**
-   * Keep only the ids the subjects may act on.
-   *
-   * Use this to post-filter a page you already loaded. To *pre*-filter at the
-   * database level, combine `accessibleResourceIds` with whatever condition
-   * expresses your computed roles — see the README's "Listing" section.
-   */
+  /** Keep only the ids the subjects may act on, in input order. */
   async function filterAccessible<
     TType extends ResourceTypeOf<TRegistry>,
   >(args: {
@@ -818,35 +976,52 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     context?: RobracContext;
     connector?: 'AND' | 'OR';
   }): Promise<string[]> {
-    const decisions = await evaluateManyInternal({ ...args, emit: false });
+    const evaluations = await evaluateBatch({ ...args, emit: false });
     return args.ids.filter((id) => {
-      const decision = decisions.get(id);
-      if (!decision) {
+      const evaluation = evaluations.get(id);
+      if (!evaluation) {
         return false;
       }
-      const allowed =
-        decision.found &&
-        checkPermissions(
-          decision.permissions,
-          args.permissions,
-          args.connector
-        );
-      emitVerdict(args.subjects, decision, args.permissions, allowed);
+      const allowed = allows(
+        evaluation.decision,
+        args.permissions,
+        args.connector
+      );
+      emitVerdict(
+        args.subjects,
+        evaluation.decision,
+        args.permissions,
+        allowed
+      );
       return allowed;
     });
   }
 
+  function assertPage(limit?: number, offset?: number): void {
+    for (const [name, value] of [
+      ['limit', limit],
+      ['offset', offset],
+    ] as const) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new RobracArgumentError(
+          `${name} must be a non-negative integer.`
+        );
+      }
+    }
+  }
+
   /**
-   * Ids the subjects hold an explicit grant on.
+   * Ids the subjects hold a live, explicit grant of a declared role on, for
+   * permission-aware SQL:
+   * `WHERE created_by = ? OR visibility = 'organization' OR id IN (<ids>)`.
    *
-   * This is the building block for permission-aware SQL: `WHERE created_by = ?
-   * OR visibility = 'organization' OR id IN (<these ids>)`. It deliberately
-   * does *not* include computed roles — those live in your data model, so only
-   * your query can express them efficiently.
+   * Built from grant rows alone: computed roles, inherited roles, overrides
+   * and the resources' own scope are not applied. Express those in the same
+   * query, e.g. `AND NOT legal_hold`.
    *
-   * `limit`/`offset` page over *grant rows*, not over distinct resources: a
-   * subject holding three roles on one resource consumes three of the limit.
-   * They exist to bound a pathological result set, not to paginate a UI.
+   * `limit`/`offset` page over grant rows ordered by grant id, not over
+   * distinct resources. They bound a pathological result set; they are not
+   * for paginating a UI.
    */
   async function accessibleResourceIds<
     TType extends ResourceTypeOf<TRegistry>,
@@ -854,49 +1029,72 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     type: TType;
     subjects: readonly SubjectRef[];
     scope?: Scope;
-    /** Keep only ids where the grant actually confers these permissions. */
+    /** Keep only ids where the grants confer these permissions. */
     permissions?: PermissionRequestOf<TRegistry, TType>;
     limit?: number;
     offset?: number;
   }): Promise<string[]> {
     const entry = resource(args.type);
     const scope = resolveScope(args.scope);
+    assertPage(args.limit, args.offset);
 
-    const grants = await options.store.listSubjectGrants({
-      scope,
-      subjects: args.subjects,
-      resourceType: args.type,
-      now: now(),
-      limit: args.limit,
-      offset: args.offset,
-    });
-
-    if (!args.permissions) {
-      return [...new Set(grants.map((grant) => grant.resourceId))];
-    }
-
-    const rolesByResource = new Map<string, string[]>();
-    for (const grant of grants) {
-      const bucket = rolesByResource.get(grant.resourceId);
-      if (bucket) {
-        bucket.push(grant.role);
-      } else {
-        rolesByResource.set(grant.resourceId, [grant.role]);
+    const at = now();
+    const rolesOf = (grants: readonly Grant[]) => {
+      const roles = new Map<string, string[]>();
+      for (const grant of grants) {
+        if (
+          grant.scope === scope &&
+          grant.resourceType === args.type &&
+          roleOf(entry, grant.role) &&
+          args.subjects.some((subject) => isSubject(grant, subject)) &&
+          isLive(grant, at)
+        ) {
+          const bucket = roles.get(grant.resourceId) ?? [];
+          bucket.push(grant.role);
+          roles.set(grant.resourceId, bucket);
+        }
       }
+      return roles;
+    };
+
+    const page = rolesOf(
+      await store.listSubjectGrants({
+        scope,
+        subjects: args.subjects,
+        resourceType: args.type,
+        now: at,
+        limit: args.limit,
+        offset: args.offset,
+      })
+    );
+    const request = args.permissions;
+    if (!request || page.size === 0) {
+      return [...page.keys()];
     }
 
-    return [...rolesByResource]
-      .filter(([, roles]) =>
-        checkPermissions(
-          buildPermissionMatrix(
-            entry.definition.statements,
-            entry.roles,
-            roles
-          ),
-          args.permissions as PermissionRequest
-        )
+    // A page holds only some of a resource's rows; judge each on all of them.
+    const complete =
+      args.limit === undefined && !args.offset
+        ? page
+        : rolesOf(
+            await store.findGrants({
+              scope,
+              resourceType: args.type,
+              resourceIds: [...page.keys()],
+              subjects: args.subjects,
+              now: at,
+            })
+          );
+    return [...page.keys()].filter((id) =>
+      checkPermissions(
+        buildPermissionMatrix(
+          entry.definition.statements,
+          entry.roles,
+          complete.get(id) ?? []
+        ),
+        request
       )
-      .map(([id]) => id);
+    );
   }
 
   /* ---------------------------------------------------------------------- */
@@ -904,30 +1102,272 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
   /* ---------------------------------------------------------------------- */
 
   function assertKnownRole(entry: CompiledResource, role: string): void {
-    if (!entry.roles[role]) {
+    if (typeof role !== 'string' || !roleOf(entry, role)) {
       throw new RobracError(
         'UNKNOWN_ROLE',
-        `Unknown role "${role}" for resource type "${entry.definition.type}".`
+        `Unknown role "${String(role)}" for resource type "${entry.definition.type}".`
       );
     }
   }
 
+  // Only the authorized tier demands a future date; trusted code may import
+  // historical rows.
+  function readExpiry(
+    value: Date | null | undefined,
+    future?: Date
+  ): Date | null {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+      throw new RobracArgumentError('expiresAt must be a valid date.');
+    }
+    if (future && value.getTime() <= future.getTime()) {
+      throw new RobracArgumentError('expiresAt must be in the future.');
+    }
+    return value;
+  }
+
+  function atomically<R>(run: (store: GrantStore) => Promise<R>): Promise<R> {
+    return store.transaction ? store.transaction(run) : run(store);
+  }
+
+  async function emitChange(event: GrantChangeEvent): Promise<void> {
+    await Promise.resolve(options.onGrantChange?.(event));
+  }
+
+  function byOf(subject: SubjectRef | null | undefined) {
+    return subject ? [subject] : null;
+  }
+
+  async function grantRole(args: {
+    ref: ResourceRef;
+    scope: Scope;
+    subject: SubjectRef;
+    role: string;
+    grantedBy: SubjectRef | null;
+    by?: readonly SubjectRef[];
+    expiresAt: Date | null;
+    at: Date;
+  }): Promise<Grant> {
+    return atomically(async (tx) => {
+      const grant = await tx.upsertGrant({
+        scope: args.scope,
+        resource: args.ref,
+        subject: args.subject,
+        role: args.role,
+        grantedBy: args.grantedBy,
+        expiresAt: args.expiresAt,
+        now: args.at,
+      });
+      await emitChange({
+        action: 'grant',
+        scope: args.scope,
+        resource: args.ref,
+        subject: args.subject,
+        roles: [args.role],
+        by: args.by ?? byOf(args.grantedBy),
+      });
+      return grant;
+    });
+  }
+
+  /** The subject's stored roles on a resource, mapped to whether any row is live. */
+  async function heldRoles(
+    tx: GrantStore,
+    scope: Scope,
+    ref: ResourceRef,
+    subject: SubjectRef,
+    at: Date
+  ): Promise<Map<string, boolean>> {
+    const grants = await tx.listResourceGrants({
+      scope,
+      resource: ref,
+      now: at,
+      includeExpired: true,
+      subject,
+    });
+    const roles = new Map<string, boolean>();
+    for (const grant of grants) {
+      if (
+        grant.scope === scope &&
+        grant.resourceType === ref.type &&
+        grant.resourceId === ref.id &&
+        isSubject(grant, subject)
+      ) {
+        roles.set(
+          grant.role,
+          roles.get(grant.role) === true || isLive(grant, at)
+        );
+      }
+    }
+    return roles;
+  }
+
   /**
-   * Unchecked grant primitives.
-   *
-   * These perform no authorization of their own — they are the trusted
-   * server-side path for seeds, migrations, admin tooling and back-office
-   * jobs. Anything reachable from a user request should go through
-   * {@link authorized} instead.
+   * The roles the caller may delete, out of those it read. A refused live role
+   * throws. A refused expired role is kept, so a concurrent renewal survives.
+   */
+  function removable(
+    held: Map<string, boolean>,
+    roles: readonly string[],
+    guard: ((role: string) => string | null) | undefined
+  ): string[] {
+    const allowed: string[] = [];
+    for (const role of roles) {
+      const live = held.get(role);
+      if (live === undefined) {
+        continue;
+      }
+      const gap = guard?.(role) ?? null;
+      if (gap === null) {
+        allowed.push(role);
+      } else if (live) {
+        throw new RobracError(
+          'FORBIDDEN',
+          `Cannot revoke role "${role}": it includes "${gap}", which you are not allowed to do.`
+        );
+      }
+    }
+    return allowed;
+  }
+
+  async function revokeRoles(args: {
+    scope: Scope;
+    ref: ResourceRef;
+    subject: SubjectRef;
+    role: string | undefined;
+    revokedBy: SubjectRef | null;
+    by?: readonly SubjectRef[];
+    at: Date;
+    guard?: (role: string) => string | null;
+  }): Promise<number> {
+    const { scope, ref, subject } = args;
+    return atomically(async (tx) => {
+      let roles: string[];
+      let deleted = 0;
+      if (args.guard) {
+        const held = await heldRoles(tx, scope, ref, subject, args.at);
+        roles = removable(
+          held,
+          args.role === undefined ? [...held.keys()] : [args.role],
+          args.guard
+        );
+        for (const role of roles) {
+          deleted += await tx.deleteGrant({
+            scope,
+            resource: ref,
+            subject,
+            role,
+          });
+        }
+      } else if (args.role !== undefined) {
+        roles = [args.role];
+        deleted = await tx.deleteGrant({
+          scope,
+          resource: ref,
+          subject,
+          role: args.role,
+        });
+      } else {
+        roles = [...(await heldRoles(tx, scope, ref, subject, args.at)).keys()];
+        deleted = await tx.deleteSubjectGrantsOnResource({
+          scope,
+          resource: ref,
+          subject,
+        });
+      }
+      if (deleted > 0) {
+        await emitChange({
+          action: 'revoke',
+          scope,
+          resource: ref,
+          subject,
+          roles,
+          by: args.by ?? byOf(args.revokedBy),
+        });
+      }
+      return deleted;
+    });
+  }
+
+  async function replaceRoles(args: {
+    scope: Scope;
+    ref: ResourceRef;
+    subject: SubjectRef;
+    roles: readonly string[];
+    grantedBy: SubjectRef | null;
+    by?: readonly SubjectRef[];
+    expiresAt: Date | null;
+    at: Date;
+    guardRemoval?: (role: string) => string | null;
+  }): Promise<Grant[]> {
+    const { scope, ref, subject } = args;
+    const wanted = unique(args.roles);
+    return atomically(async (tx) => {
+      const held = await heldRoles(tx, scope, ref, subject, args.at);
+      const removed = removable(
+        held,
+        [...held.keys()].filter((role) => !wanted.includes(role)),
+        args.guardRemoval
+      );
+      for (const role of removed) {
+        await tx.deleteGrant({ scope, resource: ref, subject, role });
+      }
+      const added: Grant[] = [];
+      for (const role of wanted) {
+        added.push(
+          await tx.upsertGrant({
+            scope,
+            resource: ref,
+            subject,
+            role,
+            grantedBy: args.grantedBy,
+            expiresAt: args.expiresAt,
+            now: args.at,
+          })
+        );
+      }
+
+      // Two events, because a downgrade is a revocation.
+      const by = args.by ?? byOf(args.grantedBy);
+      if (removed.length > 0) {
+        await emitChange({
+          action: 'revoke',
+          scope,
+          resource: ref,
+          subject,
+          roles: removed,
+          by,
+        });
+      }
+      if (wanted.length > 0) {
+        await emitChange({
+          action: 'grant',
+          scope,
+          resource: ref,
+          subject,
+          roles: wanted,
+          by,
+        });
+      }
+      return added;
+    });
+  }
+
+  /**
+   * Unchecked grant primitives for trusted server code: seeds, migrations,
+   * admin tooling and back-office jobs. Anything reachable from a user request
+   * should go through {@link authorized} instead.
    */
   const grants = {
-    list<TType extends ResourceTypeOf<TRegistry>>(args: {
+    async list<TType extends ResourceTypeOf<TRegistry>>(args: {
       type: TType;
       id: string;
       scope?: Scope;
       includeExpired?: boolean;
     }): Promise<Grant[]> {
-      return options.store.listResourceGrants({
+      return await store.listResourceGrants({
         scope: resolveScope(args.scope),
         resource: { type: args.type, id: args.id },
         now: now(),
@@ -946,28 +1386,16 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     }): Promise<Grant> {
       const entry = resource(args.type);
       assertKnownRole(entry, args.role);
-
-      const scope = resolveScope(args.scope);
-      const ref: ResourceRef = { type: args.type, id: args.id };
-      const grant = await options.store.upsertGrant({
-        scope,
-        resource: ref,
+      const at = now();
+      return await grantRole({
+        ref: { type: args.type, id: args.id },
+        scope: resolveScope(args.scope),
         subject: args.subject,
         role: args.role,
         grantedBy: args.grantedBy ?? null,
-        expiresAt: args.expiresAt ?? null,
+        expiresAt: readExpiry(args.expiresAt),
+        at,
       });
-
-      options.onGrantChange?.({
-        action: 'grant',
-        scope,
-        resource: ref,
-        subject: args.subject,
-        roles: [args.role],
-        by: args.grantedBy ? [args.grantedBy] : null,
-      });
-
-      return grant;
     },
 
     async revoke<TType extends ResourceTypeOf<TRegistry>>(args: {
@@ -977,63 +1405,17 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       /** Omit to revoke every role the subject holds on this resource. */
       role?: RoleOf<TRegistry, TType>;
       scope?: Scope;
+      /** Recorded as the actor in the audit event. */
+      revokedBy?: SubjectRef | null;
     }): Promise<number> {
-      const scope = resolveScope(args.scope);
-      const ref: ResourceRef = { type: args.type, id: args.id };
-
-      if (args.role) {
-        const deleted = await options.store.deleteGrant({
-          scope,
-          resource: ref,
-          subject: args.subject,
-          role: args.role,
-        });
-        if (deleted > 0) {
-          options.onGrantChange?.({
-            action: 'revoke',
-            scope,
-            resource: ref,
-            subject: args.subject,
-            roles: [args.role],
-            by: null,
-          });
-        }
-        return deleted;
-      }
-
-      // Read before deleting so the audit event can name the roles that were
-      // removed. "Revoked something" is not a useful audit record.
-      const held = (
-        await options.store.listResourceGrants({
-          scope,
-          resource: ref,
-          now: now(),
-          includeExpired: true,
-        })
-      ).filter(
-        (grant) =>
-          grant.subjectType === args.subject.type &&
-          grant.subjectId === args.subject.id
-      );
-
-      const deleted = await options.store.deleteSubjectGrantsOnResource({
-        scope,
-        resource: ref,
+      return await revokeRoles({
+        scope: resolveScope(args.scope),
+        ref: { type: args.type, id: args.id },
         subject: args.subject,
+        role: args.role,
+        revokedBy: args.revokedBy ?? null,
+        at: now(),
       });
-
-      if (deleted > 0) {
-        options.onGrantChange?.({
-          action: 'revoke',
-          scope,
-          resource: ref,
-          subject: args.subject,
-          roles: held.map((grant) => grant.role),
-          by: null,
-        });
-      }
-
-      return deleted;
     },
 
     /** Replace the subject's roles on a resource with exactly `roles`. */
@@ -1050,126 +1432,118 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       for (const role of args.roles) {
         assertKnownRole(entry, role);
       }
-
-      const scope = resolveScope(args.scope);
-      const ref: ResourceRef = { type: args.type, id: args.id };
-      const wanted = new Set<string>(args.roles);
-
-      // `set` is a replace, so a failure between the deletes and the upserts
-      // would leave the subject with no roles at all — a silent revocation from
-      // an operation that promised a swap. Run it in a transaction where the
-      // store offers one.
-      const run = async (store: GrantStore) => {
-        const existing = await store.listResourceGrants({
-          scope,
-          resource: ref,
-          now: now(),
-          includeExpired: true,
-        });
-
-        const removed = existing
-          .filter(
-            (grant) =>
-              grant.subjectType === args.subject.type &&
-              grant.subjectId === args.subject.id &&
-              !wanted.has(grant.role)
-          )
-          .map((grant) => grant.role);
-
-        await Promise.all(
-          removed.map((role) =>
-            store.deleteGrant({
-              scope,
-              resource: ref,
-              subject: args.subject,
-              role,
-            })
-          )
-        );
-
-        const added = await Promise.all(
-          [...wanted].map((role) =>
-            store.upsertGrant({
-              scope,
-              resource: ref,
-              subject: args.subject,
-              role,
-              grantedBy: args.grantedBy ?? null,
-              expiresAt: args.expiresAt ?? null,
-            })
-          )
-        );
-
-        return { removed, added };
-      };
-
-      const { removed, added } = options.store.transaction
-        ? await options.store.transaction(run)
-        : await run(options.store);
-
-      // Two events, because a downgrade is a revocation. Reporting only the
-      // resulting role set would hide "owner was taken away" from the audit log.
-      if (removed.length > 0) {
-        options.onGrantChange?.({
-          action: 'revoke',
-          scope,
-          resource: ref,
-          subject: args.subject,
-          roles: removed,
-          by: args.grantedBy ? [args.grantedBy] : null,
-        });
-      }
-      if (args.roles.length > 0) {
-        options.onGrantChange?.({
-          action: 'grant',
-          scope,
-          resource: ref,
-          subject: args.subject,
-          roles: args.roles,
-          by: args.grantedBy ? [args.grantedBy] : null,
-        });
-      }
-
-      return added;
+      const at = now();
+      return await replaceRoles({
+        scope: resolveScope(args.scope),
+        ref: { type: args.type, id: args.id },
+        subject: args.subject,
+        roles: args.roles,
+        grantedBy: args.grantedBy ?? null,
+        expiresAt: readExpiry(args.expiresAt),
+        at,
+      });
     },
 
     /** Drop every grant on a resource. Call this when the resource is deleted. */
-    revokeResource<TType extends ResourceTypeOf<TRegistry>>(args: {
+    async revokeResource<TType extends ResourceTypeOf<TRegistry>>(args: {
       type: TType;
       id: string;
       scope?: Scope;
     }): Promise<number> {
-      return options.store.deleteResourceGrants({
-        scope: resolveScope(args.scope),
-        resource: { type: args.type, id: args.id },
+      const scope = resolveScope(args.scope);
+      const ref = { type: args.type, id: args.id };
+      return await atomically(async (tx) => {
+        const existing = options.onGrantChange
+          ? await tx.listResourceGrants({
+              scope,
+              resource: ref,
+              now: now(),
+              includeExpired: true,
+            })
+          : [];
+        const deleted = await tx.deleteResourceGrants({ scope, resource: ref });
+        if (deleted > 0) {
+          const bySubject = new Map<string, Grant[]>();
+          for (const grant of existing) {
+            const key = JSON.stringify([grant.subjectType, grant.subjectId]);
+            bySubject.set(key, [...(bySubject.get(key) ?? []), grant]);
+          }
+          for (const held of bySubject.values()) {
+            await emitChange({
+              action: 'revoke',
+              scope,
+              resource: ref,
+              subject: { type: held[0]!.subjectType, id: held[0]!.subjectId },
+              roles: unique(held.map((grant) => grant.role)),
+              by: null,
+            });
+          }
+        }
+        return deleted;
       });
     },
 
     /**
      * Drop every grant a subject holds in a scope. Call this when a member
-     * leaves an organization or a team is dissolved.
-     *
-     * Uses the scope exactly as given — see {@link bulkScope}.
+     * leaves an organization or a team is dissolved. Uses the scope exactly as
+     * given, even under `scope: 'disabled'`.
      */
-    revokeSubject(args: {
+    async revokeSubject(args: {
       subject: SubjectRef;
       scope?: Scope;
     }): Promise<number> {
-      return options.store.deleteSubjectGrants({
-        scope: bulkScope(args.scope),
-        subject: args.subject,
+      const scope = bulkScope(args.scope);
+      const at = now();
+      return await atomically(async (tx) => {
+        const existing = options.onGrantChange
+          ? (
+              await Promise.all(
+                [...compiled.keys()].map((resourceType) =>
+                  tx.listSubjectGrants({
+                    scope,
+                    subjects: [args.subject],
+                    resourceType,
+                    now: at,
+                    includeExpired: true,
+                  })
+                )
+              )
+            ).flat()
+          : [];
+        const deleted = await tx.deleteSubjectGrants({
+          scope,
+          subject: args.subject,
+        });
+        if (deleted > 0) {
+          const byResource = new Map<string, Grant[]>();
+          for (const grant of existing) {
+            const key = JSON.stringify([grant.resourceType, grant.resourceId]);
+            byResource.set(key, [...(byResource.get(key) ?? []), grant]);
+          }
+          for (const held of byResource.values()) {
+            await emitChange({
+              action: 'revoke',
+              scope,
+              resource: {
+                type: held[0]!.resourceType,
+                id: held[0]!.resourceId,
+              },
+              subject: args.subject,
+              roles: unique(held.map((grant) => grant.role)),
+              by: null,
+            });
+          }
+        }
+        return deleted;
       });
     },
 
     /**
-     * Drop every grant in a scope. Call this when a tenant is deleted.
-     *
-     * Uses the scope exactly as given — see {@link bulkScope}.
+     * Drop every grant in a scope. Call this when a tenant is deleted. Uses the
+     * scope exactly as given and emits no per-grant events.
      */
-    revokeScope(args: { scope: Scope }): Promise<number> {
-      return options.store.deleteScopeGrants({
-        scope: bulkScope(args.scope),
-      });
+    async revokeScope(args: { scope: Scope }): Promise<number> {
+      return await store.deleteScopeGrants({ scope: bulkScope(args.scope) });
     },
   };
 
@@ -1177,15 +1551,15 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
   /* Authorized grant management                                             */
   /* ---------------------------------------------------------------------- */
 
-  async function assertCanManage(args: {
+  async function authorize(args: {
     type: string;
     id: string;
     actor: readonly SubjectRef[];
     scope: Scope;
     context: RobracContext;
-  }): Promise<AccessDecision> {
+  }): Promise<Evaluation & { entry: CompiledResource }> {
     const entry = resource(args.type);
-    const decision = await evaluateInternal({
+    const evaluation = await evaluateOne({
       type: args.type,
       id: args.id,
       subjects: args.actor,
@@ -1193,108 +1567,270 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       context: args.context,
       emit: false,
     });
-
-    if (!decision.found) {
-      throw new RobracError(
-        'RESOURCE_NOT_FOUND',
-        `Resource ${args.type}:${args.id} not found.`
-      );
-    }
-
+    const { decision } = evaluation;
     const manage = entry.definition.manage;
     const allowed =
-      typeof manage === 'function'
-        ? await manage({
+      decision.found &&
+      decision.override !== 'deny' &&
+      (typeof manage === 'function'
+        ? (await manage({
             data: decision.data,
             resource: decision.resource,
             scope: decision.scope,
             subjects: args.actor,
             context: args.context,
             permissions: decision.permissions,
-          })
-        : checkPermissions(decision.permissions, manage);
+          })) === true
+        : checkPermissions(decision.permissions, manage));
 
-    // A refused grant-management attempt is exactly the kind of event an audit
-    // log is for, so it goes through the same reporting path as `check`.
     emitVerdict(
       args.actor,
       decision,
       typeof manage === 'function' ? undefined : manage,
       allowed
     );
-
-    if (!allowed) {
+    if (!decision.found) {
       throw new RobracError(
-        'FORBIDDEN',
-        `Not allowed to manage access for ${args.type}:${args.id}.`
+        'RESOURCE_NOT_FOUND',
+        `Resource ${args.type}:${args.id} not found.`
       );
     }
+    if (!allowed) {
+      // Without any role or permission, the caller learns nothing, not even
+      // that the resource exists.
+      const visible =
+        evaluation.held.size > 0 ||
+        Object.values(decision.permissions).some((row) =>
+          Object.values(row).includes(true)
+        );
+      throw visible
+        ? new RobracError(
+            'FORBIDDEN',
+            `Not allowed to manage access for ${args.type}:${args.id}.`
+          )
+        : new RobracError(
+            'RESOURCE_NOT_FOUND',
+            `Resource ${args.type}:${args.id} not found.`
+          );
+    }
+    return { ...evaluation, entry };
+  }
 
-    return decision;
+  function unrestricted(evaluation: Evaluation): boolean {
+    return escalation === 'allow' || evaluation.decision.override === 'allow';
   }
 
   /**
-   * The permission a role confers that its would-be granter lacks, or `null`
-   * when the role is entirely within the actor's own rights.
+   * The first permission `role` confers that the actor's roles do not, or
+   * `null`. `actor` maps each role to how many levels below the root resource
+   * it still cascades.
    *
-   * Without this an "editor who may share" could mint owners and escalate
-   * laterally through any resource they can see.
+   * Compares the resource itself and, recursively, what both sides cascade to
+   * on descendants: two roles with equal permissions here can still map to
+   * very different roles below. Every type with `parent()` counts as a
+   * possible child unless its `parentTypes` excludes this one. A role this
+   * type does not declare confers nothing and cascades nowhere.
    */
   function escalationGap(
     entry: CompiledResource,
-    actorDecision: AccessDecision,
-    roleName: string
+    ref: ResourceRef,
+    actor: ReadonlyMap<string, number>,
+    role: string,
+    depth = 0,
+    visited = new Map<string, number>()
   ): string | null {
-    if (escalation === 'allow' || actorDecision.override === 'allow') {
+    if (!roleOf(entry, role)) {
       return null;
     }
-
-    const role = entry.roles[roleName];
-    if (!role) {
-      return null;
-    }
-
-    const actorPermissions = actorDecision.permissions as Record<
-      string,
-      Record<string, boolean>
-    >;
-
-    for (const [facet, actions] of Object.entries(role.effective)) {
+    const statements = entry.definition.statements;
+    const wanted = grantedActions(statements, entry.roles, [role]);
+    const held = grantedActions(statements, entry.roles, actor.keys());
+    for (const [facet, actions] of wanted) {
       for (const action of actions) {
-        const declared = entry.definition.statements[facet] ?? [];
-        const concrete = action === '*' ? declared : [action];
-        for (const candidate of concrete) {
-          if (actorPermissions[facet]?.[candidate] !== true) {
-            return `${facet}.${candidate}`;
-          }
+        if (held.get(facet)?.has(action) !== true) {
+          return depth === 0
+            ? `${facet}.${action}`
+            : `${facet}.${action} on descendant ${entry.definition.type} resources`;
         }
       }
     }
+    if (depth >= maxDepth) {
+      return null;
+    }
 
+    for (const child of compiled.values()) {
+      const { parent, parentTypes } = child.definition;
+      if (
+        !parent ||
+        (parentTypes && !parentTypes.includes(entry.definition.type))
+      ) {
+        continue;
+      }
+      const mapped = mapInherited(child, ref, role);
+      if (!mapped) {
+        continue;
+      }
+      const childActor = new Map<string, number>();
+      for (const [actorRole, reach] of actor) {
+        const inherited = mapInherited(child, ref, actorRole);
+        if (inherited && reach > depth) {
+          childActor.set(
+            inherited,
+            Math.max(childActor.get(inherited) ?? -1, reach)
+          );
+        }
+      }
+      // Keyed on reach left below the child, so an earlier visit at the same or
+      // a shallower depth explored everything this one would.
+      const key = JSON.stringify([
+        child.definition.type,
+        mapped,
+        [...childActor]
+          .map(([name, reach]) => [name, reach - depth - 1])
+          .sort(),
+      ]);
+      const seenAt = visited.get(key);
+      if (seenAt !== undefined && seenAt <= depth) {
+        continue;
+      }
+      visited.set(key, depth);
+      const gap = escalationGap(
+        child,
+        { type: child.definition.type, id: '' },
+        childActor,
+        mapped,
+        depth + 1,
+        visited
+      );
+      if (gap) {
+        return gap;
+      }
+    }
     return null;
   }
 
-  function assertNoEscalation(
+  /** Latest expiry a grant of `role` may have before it outlives the actor's own access. */
+  function grantHorizon(
     entry: CompiledResource,
-    actorDecision: AccessDecision,
-    roles: readonly string[]
-  ): void {
-    for (const roleName of roles) {
-      const gap = escalationGap(entry, actorDecision, roleName);
-      if (gap) {
-        throw new RobracError(
-          'FORBIDDEN',
-          `Cannot grant role "${roleName}": it includes "${gap}", which you are not allowed to do.`
-        );
+    ref: ResourceRef,
+    held: Held,
+    role: string
+  ): number {
+    const cutoffs = unique(
+      [...held.values()]
+        .flat()
+        .map(({ expiry }) => expiry)
+        .filter(Number.isFinite)
+    ).sort((a, b) => a - b);
+    for (const cutoff of cutoffs) {
+      if (escalationGap(entry, ref, reachAfter(held, cutoff), role)) {
+        return cutoff;
       }
+    }
+    return Infinity;
+  }
+
+  function assertCanGrant(
+    evaluation: Evaluation & { entry: CompiledResource },
+    role: string,
+    expiresAt: Date | null
+  ): void {
+    if (unrestricted(evaluation)) {
+      return;
+    }
+    const { entry, held, decision } = evaluation;
+    const gap = escalationGap(entry, decision.resource, reachAfter(held), role);
+    if (gap) {
+      throw new RobracError(
+        'FORBIDDEN',
+        `Cannot grant role "${role}": it includes "${gap}", which you are not allowed to do.`
+      );
+    }
+    const horizon = grantHorizon(entry, decision.resource, held, role);
+    if ((expiresAt?.getTime() ?? Infinity) > horizon) {
+      throw new RobracError(
+        'FORBIDDEN',
+        `Cannot grant role "${role}" beyond ${new Date(horizon).toISOString()}, when your own access to it expires.`
+      );
     }
   }
 
+  function removalGap(
+    evaluation: Evaluation & { entry: CompiledResource },
+    role: string
+  ): string | null {
+    if (unrestricted(evaluation)) {
+      return null;
+    }
+    const { entry, held, decision } = evaluation;
+    return escalationGap(entry, decision.resource, reachAfter(held), role);
+  }
+
+  async function authorizedGrant(
+    args: AuthorizedWrite & { role: string },
+    beforeWrite?: BeforeWrite
+  ): Promise<Grant> {
+    const entry = resource(args.type);
+    assertKnownRole(entry, args.role);
+    const scope = resolveScope(args.scope);
+    const at = now();
+    const expiresAt = readExpiry(args.expiresAt, at);
+    const evaluation = await authorize({
+      ...args,
+      scope,
+      context: args.context ?? {},
+    });
+    assertCanGrant(evaluation, args.role, expiresAt);
+    await beforeWrite?.();
+    return grantRole({
+      ref: evaluation.decision.resource,
+      scope,
+      subject: args.subject,
+      role: args.role,
+      grantedBy: args.grantedBy ?? args.actor[0] ?? null,
+      by: args.grantedBy ? [args.grantedBy] : args.actor,
+      expiresAt,
+      at,
+    });
+  }
+
+  async function authorizedSetRoles(
+    args: AuthorizedWrite & { roles: readonly string[] },
+    beforeWrite?: BeforeWrite
+  ): Promise<Grant[]> {
+    const entry = resource(args.type);
+    for (const role of args.roles) {
+      assertKnownRole(entry, role);
+    }
+    const scope = resolveScope(args.scope);
+    const at = now();
+    const expiresAt = readExpiry(args.expiresAt, at);
+    const evaluation = await authorize({
+      ...args,
+      scope,
+      context: args.context ?? {},
+    });
+    for (const role of args.roles) {
+      assertCanGrant(evaluation, role, expiresAt);
+    }
+    await beforeWrite?.();
+    return replaceRoles({
+      scope,
+      ref: evaluation.decision.resource,
+      subject: args.subject,
+      roles: args.roles,
+      grantedBy: args.grantedBy ?? args.actor[0] ?? null,
+      by: args.grantedBy ? [args.grantedBy] : args.actor,
+      expiresAt,
+      at,
+      guardRemoval: (role) => removalGap(evaluation, role),
+    });
+  }
+
   /**
-   * Grant management on behalf of a caller.
-   *
-   * Every method here enforces the resource's `manage` permission and, unless
-   * `escalation: 'allow'`, refuses to grant more than the caller holds.
+   * Grant management on behalf of a caller. Every method enforces the
+   * resource's `manage` permission and, unless `escalation: 'allow'`, refuses
+   * to grant, extend or revoke more than the caller itself holds.
    */
   const authorized = {
     async listGrants<TType extends ResourceTypeOf<TRegistry>>(args: {
@@ -1305,29 +1841,42 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       context?: RobracContext;
     }): Promise<{
       grants: Grant[];
-      /** Roles this actor may actually hand out. Render these as choices. */
+      /**
+       * Roles this actor may hand out. A caller whose own access expires must
+       * also pass an `expiresAt` no later than that.
+       */
       availableRoles: string[];
       /** Every role the resource type declares, grantable or not. */
       declaredRoles: string[];
     }> {
       const scope = resolveScope(args.scope);
-      const decision = await assertCanManage({
-        type: args.type,
-        id: args.id,
-        actor: args.actor,
+      const evaluation = await authorize({
+        ...args,
         scope,
         context: args.context ?? {},
       });
-
-      const entry = resource(args.type);
+      const { entry, held, decision } = evaluation;
       const declaredRoles = Object.keys(entry.roles);
-
+      const { type, id } = decision.resource;
+      const at = now();
+      const grants = await store.listResourceGrants({
+        scope,
+        resource: decision.resource,
+        now: at,
+      });
       return {
-        grants: await grants.list({ type: args.type, id: args.id, scope }),
-        // Filtered by the same anti-escalation rule `grant` enforces, so a
-        // share dialog cannot offer a role that will be rejected on submit.
+        grants: grants.filter(
+          (grant) =>
+            grant.scope === scope &&
+            grant.resourceType === type &&
+            grant.resourceId === id &&
+            isLive(grant, at)
+        ),
         availableRoles: declaredRoles.filter(
-          (role) => escalationGap(entry, decision, role) === null
+          (role) =>
+            unrestricted(evaluation) ||
+            escalationGap(entry, decision.resource, reachAfter(held), role) ===
+              null
         ),
         declaredRoles,
       };
@@ -1345,24 +1894,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       expiresAt?: Date | null;
       context?: RobracContext;
     }): Promise<Grant> {
-      const entry = resource(args.type);
-      assertKnownRole(entry, args.role);
-
-      const scope = resolveScope(args.scope);
-      const decision = await assertCanManage({
-        type: args.type,
-        id: args.id,
-        actor: args.actor,
-        scope,
-        context: args.context ?? {},
-      });
-      assertNoEscalation(entry, decision, [args.role]);
-
-      return await grants.grant({
-        ...args,
-        scope,
-        grantedBy: args.grantedBy ?? args.actor[0] ?? null,
-      });
+      return await authorizedGrant(args);
     },
 
     async setRoles<TType extends ResourceTypeOf<TRegistry>>(args: {
@@ -1376,26 +1908,7 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       expiresAt?: Date | null;
       context?: RobracContext;
     }): Promise<Grant[]> {
-      const entry = resource(args.type);
-      for (const role of args.roles) {
-        assertKnownRole(entry, role);
-      }
-
-      const scope = resolveScope(args.scope);
-      const decision = await assertCanManage({
-        type: args.type,
-        id: args.id,
-        actor: args.actor,
-        scope,
-        context: args.context ?? {},
-      });
-      assertNoEscalation(entry, decision, args.roles);
-
-      return await grants.set({
-        ...args,
-        scope,
-        grantedBy: args.grantedBy ?? args.actor[0] ?? null,
-      });
+      return await authorizedSetRoles(args);
     },
 
     async revoke<TType extends ResourceTypeOf<TRegistry>>(args: {
@@ -1404,23 +1917,31 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
       subject: SubjectRef;
       role?: RoleOf<TRegistry, TType>;
       actor: readonly SubjectRef[];
+      /** Recorded as the actor in the audit event instead of `actor`. */
+      revokedBy?: SubjectRef;
       scope?: Scope;
       context?: RobracContext;
     }): Promise<number> {
       const scope = resolveScope(args.scope);
-      await assertCanManage({
-        type: args.type,
-        id: args.id,
-        actor: args.actor,
+      const evaluation = await authorize({
+        ...args,
         scope,
         context: args.context ?? {},
       });
-
-      return await grants.revoke({ ...args, scope });
+      return revokeRoles({
+        scope,
+        ref: evaluation.decision.resource,
+        subject: args.subject,
+        role: args.role,
+        revokedBy: args.revokedBy ?? args.actor[0] ?? null,
+        by: args.revokedBy ? [args.revokedBy] : args.actor,
+        at: now(),
+        guard: (role) => removalGap(evaluation, role),
+      });
     },
   };
 
-  return {
+  const engine = {
     evaluate,
     evaluateMany,
     check,
@@ -1440,4 +1961,9 @@ export function createRobrac<const TRegistry extends ResourceRegistry>(
     /** The registry this engine was built from. Useful for `$Infer` plumbing. */
     resources: options.resources,
   };
+  checkedWrites.set(engine, {
+    grant: authorizedGrant,
+    setRoles: authorizedSetRoles,
+  });
+  return engine;
 }

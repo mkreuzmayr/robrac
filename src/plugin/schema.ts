@@ -43,12 +43,10 @@ export type GrantSchemaOptions = {
 /**
  * Better Auth schema for the grants table.
  *
- * Note what is *not* expressible here: a composite unique index over
- * `(scope, resourceType, resourceId, subjectType, subjectId, role)`. Better
- * Auth's schema DSL only knows single-column `unique`. Add that index in your
- * own migration — the README has the SQL. Without it, concurrent grants of the
- * same role can produce duplicate rows; those are harmless for decisions
- * (roles are a set) but they clutter share dialogs.
+ * Better Auth's schema DSL cannot express the composite unique index over
+ * `(scope, resourceType, resourceId, subjectType, subjectId, role)`; add it in
+ * your own migration (the README has the SQL). The default store converges
+ * concurrent duplicates without it, but the index closes the race.
  */
 export function grantSchema(options: GrantSchemaOptions = {}) {
   const field = (name: GrantField) => options.fields?.[name];

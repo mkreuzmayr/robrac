@@ -1,10 +1,9 @@
 // Installs a packed robrac tarball into a throwaway project and exercises all three
-// entrypoints from *outside* the repo — the only way to catch a broken `exports` map,
+// entrypoints from *outside* the repo. It is the only way to catch a broken `exports` map,
 // a missing file in `files`, or a runtime that the published ESM does not actually run
 // on. Run as: node scripts/smoke-consumer.mjs <path-to-tarball>
-import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -14,8 +13,15 @@ if (!tarball) {
   process.exit(1);
 }
 
+const { devDependencies } =
+  /** @type {{ devDependencies: Record<string, string> }} */ (
+    JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+    )
+  );
+
 const dir = mkdtempSync(join(tmpdir(), 'robrac-smoke-'));
-console.log(`node ${process.version} — consumer at ${dir}`);
+console.log(`node ${process.version}, consumer at ${dir}`);
 
 writeFileSync(
   join(dir, 'package.json'),
@@ -43,8 +49,9 @@ run('npm', [
   'install',
   '--no-audit',
   '--no-fund',
+  '--ignore-scripts',
   resolve(tarball),
-  'better-auth@^1.6.0',
+  `better-auth@${devDependencies['better-auth']}`,
 ]);
 
 writeFileSync(
@@ -67,6 +74,7 @@ const document = defineResource({
   },
   load: async ({ id }) => ({ id, organizationId: 'org_1' }),
   scope: (row) => row.organizationId,
+  manage: { document: ['update'] },
 });
 
 const robrac = createTestRobrac({ resources: { document } });
@@ -102,4 +110,3 @@ console.log('smoke ok');
 );
 
 run('node', ['smoke.mjs']);
-assert.ok(true);

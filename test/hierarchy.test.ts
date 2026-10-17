@@ -2,285 +2,223 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { defineResource } from '../src/index.ts';
-import { createTestRobrac, subjects } from '../src/testing.ts';
-import { createFixture, registry } from './fixtures.ts';
+import { createTestRobrac } from '../src/testing.ts';
+import {
+  at,
+  createData,
+  member,
+  ORG,
+  OTHER_ORG,
+  registry,
+} from './fixtures.ts';
 
-const ORG = 'org_1';
-const bob = subjects(['user', 'u_bob'], ['member', 'm_bob']);
-
-function setup() {
-  const fixture = createFixture();
-  fixture.folders.set('fld_root', {
-    id: 'fld_root',
-    organizationId: ORG,
-    name: 'Root',
+function setup(maxInheritanceDepth?: number) {
+  const data = createData();
+  const robrac = createTestRobrac({
+    resources: registry(data),
+    now: at('2026-01-01'),
+    maxInheritanceDepth,
   });
-  fixture.documents.set('doc_in_folder', {
-    id: 'doc_in_folder',
-    organizationId: ORG,
-    folderId: 'fld_root',
-    createdBy: 'u_alice',
-    visibility: 'private',
-  });
-  fixture.documents.set('doc_loose', {
-    id: 'doc_loose',
-    organizationId: ORG,
-    folderId: null,
-    createdBy: 'u_alice',
-    visibility: 'private',
-  });
-
-  return {
-    fixture,
-    robrac: createTestRobrac({ resources: registry(fixture) }),
-  };
+  const grantFolder = (
+    id: string,
+    role: 'viewer' | 'owner',
+    expiresAt?: Date
+  ) =>
+    robrac.grants.grant({
+      type: 'folder',
+      id,
+      scope: ORG,
+      subject: member('m_bob')[0]!,
+      role,
+      expiresAt,
+    });
+  const doc = (id: string) =>
+    robrac.evaluate({
+      type: 'document',
+      id,
+      scope: ORG,
+      subjects: member('m_bob'),
+    });
+  return { data, robrac, grantFolder, doc };
 }
 
-describe('parent inheritance', () => {
-  it('cascades a folder grant onto the documents inside it', async () => {
-    const { robrac } = setup();
+describe('resource hierarchy', () => {
+  it('cascades a folder grant to its documents', async () => {
+    const { data, grantFolder, doc } = setup();
+    data.folders.set('f1', { id: 'f1', organizationId: ORG });
+    data.documents.set('d1', { id: 'd1', organizationId: ORG, folderId: 'f1' });
+    await grantFolder('f1', 'owner');
 
-    await robrac.grants.grant({
-      type: 'folder',
-      id: 'fld_root',
-      scope: ORG,
-      subject: { type: 'member', id: 'm_bob' },
-      role: 'editor',
-    });
-
-    const decision = await robrac.evaluate({
-      type: 'document',
-      id: 'doc_in_folder',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    assert.deepEqual(decision.effectiveRoles, ['editor']);
-    assert.equal(decision.permissions.document.update, true);
-    assert.equal(decision.permissions.document.delete, false);
-
-    const inherited = decision.roles[0];
-    assert.equal(inherited?.origin, 'inherited');
-    assert.deepEqual(inherited?.via, { type: 'folder', id: 'fld_root' });
+    const decision = await doc('d1');
+    assert.equal(decision.permissions.document.delete, true);
+    assert.deepEqual(decision.roles, [
+      { role: 'owner', origin: 'inherited', via: { type: 'folder', id: 'f1' } },
+    ]);
   });
 
-  it('leaves documents outside the folder untouched', async () => {
-    const { robrac } = setup();
+  it('propagates a deny override to every descendant', async () => {
+    const { data, grantFolder, doc } = setup();
+    data.folders.set('root', { id: 'root', organizationId: ORG, hold: true });
+    data.folders.set('f1', { id: 'f1', organizationId: ORG, parentId: 'root' });
+    data.documents.set('d1', {
+      id: 'd1',
+      organizationId: ORG,
+      folderId: 'f1',
+    });
+    await grantFolder('f1', 'owner');
 
+    const decision = await doc('d1');
+    assert.equal(decision.override, 'deny');
+    assert.equal(decision.permissions.document.read, false);
+  });
+
+  it('blocks grant management on descendants of a denied ancestor', async () => {
+    const { data, robrac, grantFolder } = setup();
+    data.folders.set('f1', { id: 'f1', organizationId: ORG, hold: true });
+    data.documents.set('d1', { id: 'd1', organizationId: ORG, folderId: 'f1' });
+    await grantFolder('f1', 'owner');
     await robrac.grants.grant({
-      type: 'folder',
-      id: 'fld_root',
+      type: 'document',
+      id: 'd1',
       scope: ORG,
-      subject: { type: 'member', id: 'm_bob' },
+      subject: member('m_bob')[0]!,
       role: 'owner',
     });
-
-    const decision = await robrac.evaluate({
-      type: 'document',
-      id: 'doc_loose',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    assert.deepEqual(decision.effectiveRoles, []);
+    await assert.rejects(
+      robrac.authorized.revoke({
+        type: 'document',
+        id: 'd1',
+        scope: ORG,
+        actor: member('m_bob'),
+        subject: member('m_bob')[0]!,
+      }),
+      { code: 'FORBIDDEN' }
+    );
   });
 
-  it('drops ancestor roles the child does not declare', async () => {
-    const fixture = createFixture();
-    fixture.folders.set('fld_1', {
-      id: 'fld_1',
-      organizationId: ORG,
-      name: 'F',
+  it('drops role names a type does not declare', async () => {
+    const space = defineResource({
+      type: 'space',
+      statements: { space: ['read'] },
+      roles: { admin: { space: ['read'] } },
+      load: ({ id }) => ({ id }),
+      manage: { space: ['read'] },
     });
-    fixture.documents.set('doc_1', {
-      id: 'doc_1',
-      organizationId: ORG,
-      folderId: 'fld_1',
-      createdBy: 'u_alice',
-      visibility: 'private',
-    });
-
-    const robrac = createTestRobrac({
-      resources: {
-        folder: defineResource({
-          type: 'folder',
-          statements: { folder: ['read', 'share'] },
-          roles: { auditor: { folder: ['read'] } },
-          load: ({ id }) => fixture.folders.get(id) ?? null,
-          scope: (folder) => folder.organizationId,
-          manage: { folder: ['share'] },
-        }),
-        document: defineResource({
-          type: 'document',
-          statements: { document: ['read'] },
-          roles: { viewer: { document: ['read'] } },
-          load: ({ id }) => fixture.documents.get(id) ?? null,
-          scope: (document) => document.organizationId,
-          parent: ({ data }) =>
-            data.folderId ? { type: 'folder', id: data.folderId } : null,
-          manage: { document: ['read'] },
-        }),
+    const page = defineResource({
+      type: 'page',
+      statements: { page: ['read'] },
+      roles: { reader: { page: ['read'] } },
+      load: ({ id }) => ({ id }),
+      computeRoles: ({ roles }) => {
+        roles.push('ghost' as never);
       },
+      parent: () => ({ type: 'space', id: 's1' }),
+      inheritRole: ({ role }) => (role === 'admin' ? 'phantom' : role) as never,
+      manage: { page: ['read'] },
+    });
+    const robrac = createTestRobrac({
+      resources: { space, page },
+      scope: 'disabled',
+    });
+    const subject = { type: 'user', id: 'u' };
+    await robrac.grants.grant({
+      type: 'space',
+      id: 's1',
+      subject,
+      role: 'admin',
+    });
+    await robrac.store.upsertGrant({
+      scope: null,
+      resource: { type: 'space', id: 's1' },
+      subject,
+      role: 'reader',
+      grantedBy: null,
+      expiresAt: null,
     });
 
+    const decision = await robrac.evaluate({
+      type: 'page',
+      id: 'p1',
+      subjects: [subject],
+    });
+    assert.deepEqual(decision.roles, []);
+    assert.equal(decision.permissions.page.read, false);
+  });
+
+  it('lets an inherited role expire with the ancestor grant', async () => {
+    const { data, robrac, grantFolder, doc } = setup();
+    data.folders.set('f1', { id: 'f1', organizationId: ORG });
+    data.documents.set('d1', { id: 'd1', organizationId: ORG, folderId: 'f1' });
+    await grantFolder('f1', 'viewer', at('2026-01-02'));
+
+    assert.equal((await doc('d1')).permissions.document.read, true);
+    robrac.clock.now = at('2026-01-03');
+    assert.equal((await doc('d1')).permissions.document.read, false);
+  });
+
+  it('ignores an ancestor in another tenant', async () => {
+    const { data, robrac, doc } = setup();
+    data.folders.set('f_other', { id: 'f_other', organizationId: OTHER_ORG });
+    data.documents.set('d1', {
+      id: 'd1',
+      organizationId: ORG,
+      folderId: 'f_other',
+    });
     await robrac.grants.grant({
       type: 'folder',
-      id: 'fld_1',
+      id: 'f_other',
       scope: ORG,
-      subject: { type: 'member', id: 'm_bob' },
-      role: 'auditor',
+      subject: member('m_bob')[0]!,
+      role: 'owner',
     });
-
-    // No `inheritRole` and no matching role name on the child: the default is
-    // to drop the role rather than guess at a mapping.
-    const decision = await robrac.evaluate({
-      type: 'document',
-      id: 'doc_1',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    assert.deepEqual(decision.effectiveRoles, []);
+    assert.equal((await doc('d1')).permissions.document.read, false);
   });
 
-  it('translates ancestor roles through inheritRole', async () => {
-    const fixture = createFixture();
-    fixture.folders.set('fld_1', {
-      id: 'fld_1',
-      organizationId: ORG,
-      name: 'F',
-    });
-    fixture.documents.set('doc_1', {
-      id: 'doc_1',
-      organizationId: ORG,
-      folderId: 'fld_1',
-      createdBy: 'u_alice',
-      visibility: 'private',
-    });
-
-    const robrac = createTestRobrac({
-      resources: {
-        folder: defineResource({
-          type: 'folder',
-          statements: { folder: ['read', 'share'] },
-          roles: { curator: { folder: ['read', 'share'] } },
-          load: ({ id }) => fixture.folders.get(id) ?? null,
-          scope: (folder) => folder.organizationId,
-          manage: { folder: ['share'] },
-        }),
-        document: defineResource({
-          type: 'document',
-          statements: { document: ['read', 'update'] },
-          roles: {
-            viewer: { document: ['read'] },
-            editor: { document: ['read', 'update'] },
+  it('rejects a parent() type outside parentTypes or the registry', async () => {
+    for (const [parentType, parentTypes] of [
+      ['document', ['folder']],
+      ['workspace', undefined],
+    ] as const) {
+      const data = createData();
+      const resources = registry(data);
+      const robrac = createTestRobrac({
+        resources: {
+          ...resources,
+          document: {
+            ...resources.document,
+            parent: () => ({ type: parentType, id: 'd1' }),
+            parentTypes,
           },
-          load: ({ id }) => fixture.documents.get(id) ?? null,
-          scope: (document) => document.organizationId,
-          parent: ({ data }) =>
-            data.folderId ? { type: 'folder', id: data.folderId } : null,
-          inheritRole: ({ role }) => (role === 'curator' ? 'editor' : null),
-          manage: { document: ['update'] },
+        },
+      });
+      data.documents.set('d1', { id: 'd1', organizationId: ORG });
+      await assert.rejects(
+        robrac.evaluate({
+          type: 'document',
+          id: 'd1',
+          scope: ORG,
+          subjects: [],
         }),
-      },
-    });
-
-    await robrac.grants.grant({
-      type: 'folder',
-      id: 'fld_1',
-      scope: ORG,
-      subject: { type: 'member', id: 'm_bob' },
-      role: 'curator',
-    });
-
-    const decision = await robrac.evaluate({
-      type: 'document',
-      id: 'doc_1',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    assert.deepEqual(decision.effectiveRoles, ['editor']);
-    assert.equal(decision.permissions.document.update, true);
+        { code: 'INVALID_CONFIGURATION' }
+      );
+    }
   });
 
-  it('stops at maxInheritanceDepth instead of looping forever', async () => {
-    // A folder that is its own parent: pathological data that must not hang.
-    const fixture = createFixture();
-    fixture.folders.set('fld_loop', {
-      id: 'fld_loop',
-      organizationId: ORG,
-      name: 'Loop',
-    });
-
-    const robrac = createTestRobrac({
-      maxInheritanceDepth: 3,
-      resources: {
-        folder: defineResource({
-          type: 'folder',
-          statements: { folder: ['read', 'share'] },
-          roles: { viewer: { folder: ['read'] } },
-          load: ({ id }) => fixture.folders.get(id) ?? null,
-          scope: (folder) => folder.organizationId,
-          parent: ({ resource }) => ({ type: 'folder', id: resource.id }),
-          manage: { folder: ['share'] },
-        }),
-      },
-    });
-
-    await robrac.grants.grant({
-      type: 'folder',
-      id: 'fld_loop',
-      scope: ORG,
-      subject: { type: 'member', id: 'm_bob' },
-      role: 'viewer',
-    });
-
-    const decision = await robrac.evaluate({
-      type: 'folder',
-      id: 'fld_loop',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    // The role is still resolved; it is just deduplicated into one entry.
-    assert.deepEqual(decision.effectiveRoles, ['viewer']);
-    assert.equal(decision.permissions.folder.read, true);
+  it('stops at maxInheritanceDepth', async () => {
+    const { data, grantFolder, doc } = setup(1);
+    data.folders.set('root', { id: 'root', organizationId: ORG });
+    data.folders.set('f1', { id: 'f1', organizationId: ORG, parentId: 'root' });
+    data.documents.set('d1', { id: 'd1', organizationId: ORG, folderId: 'f1' });
+    await grantFolder('root', 'owner');
+    assert.equal((await doc('d1')).permissions.document.read, false);
   });
 
-  it('does not leak a grant across tenants through the parent chain', async () => {
-    const { fixture, robrac } = setup();
-    fixture.folders.set('fld_other', {
-      id: 'fld_other',
-      organizationId: 'org_2',
-      name: 'Other tenant',
-    });
-    fixture.documents.set('doc_crossed', {
-      id: 'doc_crossed',
-      organizationId: ORG,
-      folderId: 'fld_other',
-      createdBy: 'u_alice',
-      visibility: 'private',
-    });
-
-    await robrac.grants.grant({
-      type: 'folder',
-      id: 'fld_other',
-      scope: 'org_2',
-      subject: { type: 'member', id: 'm_bob' },
-      role: 'owner',
-    });
-
-    const decision = await robrac.evaluate({
-      type: 'document',
-      id: 'doc_crossed',
-      scope: ORG,
-      subjects: bob,
-    });
-
-    // The parent belongs to another tenant, so it fails the scope check and
-    // contributes nothing.
-    assert.equal(decision.found, true);
-    assert.deepEqual(decision.effectiveRoles, []);
+  it('tolerates a parent cycle', async () => {
+    const { data, grantFolder, doc } = setup(64);
+    data.folders.set('a', { id: 'a', organizationId: ORG, parentId: 'b' });
+    data.folders.set('b', { id: 'b', organizationId: ORG, parentId: 'a' });
+    data.documents.set('d1', { id: 'd1', organizationId: ORG, folderId: 'a' });
+    await grantFolder('b', 'viewer');
+    assert.equal((await doc('d1')).permissions.document.read, true);
   });
 });

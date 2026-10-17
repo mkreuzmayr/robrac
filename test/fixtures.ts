@@ -1,60 +1,53 @@
-import { defineResource, extendRole } from '../src/index.ts';
+import { defineResource, extendRole, hasSubject } from '../src/index.ts';
+import type { SubjectRef } from '../src/index.ts';
 
-/* -------------------------------------------------------------------------- */
-/* A small document store, standing in for a real application's data model.   */
-/* -------------------------------------------------------------------------- */
+export const ORG = 'org_1';
+export const OTHER_ORG = 'org_2';
 
 export type Folder = {
   id: string;
   organizationId: string;
-  name: string;
+  parentId?: string | null;
+  hold?: boolean;
 };
 
 export type Document = {
   id: string;
   organizationId: string;
-  folderId: string | null;
-  createdBy: string;
-  visibility: 'private' | 'organization';
-  legalHold?: boolean;
+  folderId?: string | null;
+  createdBy?: string;
+  visibility?: 'private' | 'organization';
+  hold?: boolean;
 };
 
-export type Fixture = {
-  folders: Map<string, Folder>;
-  documents: Map<string, Document>;
-  loads: { folder: number; document: number };
-};
-
-export function createFixture(): Fixture {
+export function createData() {
   return {
-    folders: new Map(),
-    documents: new Map(),
-    loads: { folder: 0, document: 0 },
+    folders: new Map<string, Folder>(),
+    documents: new Map<string, Document>(),
   };
 }
 
-export function folderResource(fixture: Fixture) {
-  return defineResource({
+export type Data = ReturnType<typeof createData>;
+
+export function registry(data: Data) {
+  const folder = defineResource({
     type: 'folder',
-    statements: {
-      folder: ['read', 'update', 'delete', 'share'],
-    },
+    statements: { folder: ['read', 'update', 'delete', 'share'] },
     roles: {
       viewer: { folder: ['read'] },
       editor: extendRole(['viewer'], { folder: ['update'] }),
       owner: extendRole(['editor'], { folder: ['delete', 'share'] }),
     },
-    load: ({ id }) => {
-      fixture.loads.folder++;
-      return fixture.folders.get(id) ?? null;
-    },
-    scope: (folder) => folder.organizationId,
+    load: ({ id }) => data.folders.get(id) ?? null,
+    scope: (row) => row.organizationId,
+    override: ({ data: row }) => (row.hold ? 'deny' : null),
+    parent: ({ data: row }) =>
+      row.parentId ? { type: 'folder', id: row.parentId } : null,
+    parentTypes: ['folder'],
     manage: { folder: ['share'] },
   });
-}
 
-export function documentResource(fixture: Fixture) {
-  return defineResource({
+  const document = defineResource({
     type: 'document',
     statements: {
       document: ['read', 'update', 'delete', 'share'],
@@ -62,48 +55,36 @@ export function documentResource(fixture: Fixture) {
     },
     roles: {
       viewer: { document: ['read'], comment: ['read'] },
-      commenter: extendRole(['viewer'], { comment: ['write'] }),
-      editor: extendRole(['commenter'], { document: ['update'] }),
-      owner: extendRole(['editor'], { document: ['delete', 'share'] }),
+      sharer: extendRole(['viewer'], { document: ['share'] }),
+      editor: extendRole(['viewer'], {
+        document: ['update', 'share'],
+        comment: ['write'],
+      }),
+      owner: extendRole(['editor'], { document: ['delete'] }),
     },
-    load: ({ id }) => {
-      fixture.loads.document++;
-      return fixture.documents.get(id) ?? null;
+    load: ({ id }) => data.documents.get(id) ?? null,
+    loadMany: ({ ids }) =>
+      new Map(
+        ids.flatMap((id) => {
+          const row = data.documents.get(id);
+          return row ? [[id, row] as const] : [];
+        })
+      ),
+    scope: (row) => row.organizationId,
+    computeRoles: ({ data: row, subjects, roles }) => {
+      if (hasSubject(subjects, 'user', row.createdBy)) roles.push('owner');
+      if (row.visibility === 'organization') roles.push('viewer');
     },
-    loadMany: ({ ids }) => {
-      fixture.loads.document++;
-      const found = new Map<string, Document>();
-      for (const id of ids) {
-        const document = fixture.documents.get(id);
-        if (document) {
-          found.set(id, document);
-        }
-      }
-      return found;
-    },
-    scope: (document) => document.organizationId,
-    computeRoles: ({ data, subjects, roles }) => {
-      if (subjects.some((s) => s.type === 'user' && s.id === data.createdBy)) {
-        roles.push('owner');
-      }
-      if (data.visibility === 'organization') {
-        roles.push('viewer');
-      }
-    },
-    override: ({ data }) => (data.legalHold ? 'deny' : null),
-    parent: ({ data }) =>
-      data.folderId ? { type: 'folder', id: data.folderId } : null,
-    // The ancestor role arrives as a plain string; the return type only admits
-    // this resource's declared roles, so the identity mapping needs a check.
-    inheritRole: ({ role }) =>
-      role === 'viewer' || role === 'editor' || role === 'owner' ? role : null,
+    override: ({ data: row }) => (row.hold ? 'deny' : null),
+    parent: ({ data: row }) =>
+      row.folderId ? { type: 'folder', id: row.folderId } : null,
+    parentTypes: ['folder'],
     manage: { document: ['share'] },
   });
+
+  return { folder, document };
 }
 
-export function registry(fixture: Fixture) {
-  return {
-    folder: folderResource(fixture),
-    document: documentResource(fixture),
-  };
-}
+export const member = (id: string): SubjectRef[] => [{ type: 'member', id }];
+export const user = (id: string): SubjectRef[] => [{ type: 'user', id }];
+export const at = (iso: string) => new Date(`${iso}T00:00:00Z`);

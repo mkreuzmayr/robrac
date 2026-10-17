@@ -1,26 +1,20 @@
 import type { Grant, ResourceRef, Scope, SubjectRef } from '../core/types.ts';
 
 /**
- * Everything robrac needs from a database.
- *
- * This is the entire ORM boundary. `robrac` ships two
- * implementations — one over Better Auth's internal adapter (works with
- * Drizzle, Prisma, Kysely, Mongo, or a direct connection without any extra
- * code) and one in memory — but a team with an existing grants table or a
- * hot-path performance requirement can implement these eight methods against
- * raw SQL and lose nothing. `transaction` is optional.
+ * Everything robrac needs from a database: nine methods plus an optional
+ * `transaction`.
  *
  * Implementation contract:
+ * - Reads are complete. A store must never silently truncate a result; page
+ *   internally if the backend caps result sizes.
  * - Reads never return rows whose `expiresAt` is at or before the supplied
- *   `now`, unless the caller opts in with `includeExpired`. Every read takes
- *   `now` as a parameter rather than calling the clock itself, so a frozen
- *   clock in tests governs the whole engine.
+ *   `now`, unless the caller opts in with `includeExpired`. Stores take `now`
+ *   from the caller instead of reading the clock, so a frozen clock in tests
+ *   governs the whole engine.
  * - `scope` participates in every predicate. `null` is a real value, not a
  *   wildcard: `scope: null` matches only rows stored with no scope.
- * - `limit`/`offset` apply *after* expiry and subject filtering. A store that
- *   pushes them into SQL ahead of those filters silently drops rows the caller
- *   is entitled to; see `listSubjectGrants` in `store/better-auth.ts` for how
- *   to page correctly against a backend that cannot express the filters.
+ * - `limit`/`offset` apply *after* expiry and subject filtering.
+ * - Returned grants are copies; mutating them must not change stored state.
  */
 export type GrantStore = {
   /**
@@ -35,33 +29,38 @@ export type GrantStore = {
     now: Date;
   }): Promise<Grant[]>;
 
-  /** Every grant on one resource, regardless of subject. Powers share dialogs. */
+  /**
+   * Every grant on one resource, ordered by `createdAt`. Powers share dialogs.
+   * When `subject` is given, only that subject's grants are needed; a store
+   * may ignore the hint and return all of them.
+   */
   listResourceGrants(query: {
     scope: Scope;
     resource: ResourceRef;
     now: Date;
     includeExpired?: boolean;
+    subject?: SubjectRef;
   }): Promise<Grant[]>;
 
   /**
-   * Every live grant a subject holds on a resource type. Used to build
-   * permission-aware `WHERE resource_id IN (...)` filters in application
-   * queries.
-   *
-   * `limit`/`offset` count *live, matching* rows — see the contract note above.
+   * Every grant a subject holds on a resource type, ordered by grant id; only
+   * live ones unless `includeExpired`. Used to build permission-aware
+   * `WHERE resource_id IN (...)` filters.
    */
   listSubjectGrants(query: {
     scope: Scope;
     subjects: readonly SubjectRef[];
     resourceType: string;
     now: Date;
+    includeExpired?: boolean;
     limit?: number;
     offset?: number;
   }): Promise<Grant[]>;
 
   /**
    * Insert the grant, or refresh `expiresAt` / `grantedBy` if it already
-   * exists. Must be safe to call concurrently for the same tuple.
+   * exists. Must be safe to call concurrently for the same tuple and must
+   * leave exactly one row for it. `now` stamps `createdAt` / `updatedAt`.
    */
   upsertGrant(input: {
     scope: Scope;
@@ -70,6 +69,7 @@ export type GrantStore = {
     role: string;
     grantedBy: SubjectRef | null;
     expiresAt: Date | null;
+    now?: Date;
   }): Promise<Grant>;
 
   /** Remove one role from one subject on one resource. */
@@ -93,10 +93,7 @@ export type GrantStore = {
     resource: ResourceRef;
   }): Promise<number>;
 
-  /**
-   * Remove every grant a subject holds anywhere in a scope. Call this when a
-   * member leaves an organization or a team is dissolved.
-   */
+  /** Remove every grant a subject holds anywhere in a scope. */
   deleteSubjectGrants(query: {
     scope: Scope;
     subject: SubjectRef;
@@ -106,12 +103,9 @@ export type GrantStore = {
   deleteScopeGrants(query: { scope: Scope }): Promise<number>;
 
   /**
-   * Run several operations atomically.
-   *
-   * Optional: when absent, robrac composes the operations without a
-   * transaction. Implement it if your backend supports one — `setRoles` is a
-   * replace, and a failure between its deletes and its upserts would otherwise
-   * leave a subject with no roles at all.
+   * Run several operations atomically. Only implement it when the backend
+   * really provides atomicity; robrac composes the operations without one
+   * when it is absent.
    */
   transaction?<R>(run: (store: GrantStore) => Promise<R>): Promise<R>;
 };
